@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>API Chain Tester</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <div class="logo">
+      <h1>⚡ API Chain Tester</h1>
+      <p>End-to-end CRUD automation</p>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-page="import">
+        <span class="icon">📄</span> Import Spec
+      </button>
+      <button class="nav-item" data-page="chain">
+        <span class="icon">🔗</span> Configure Chain
+      </button>
+      <button class="nav-item" data-page="data">
+        <span class="icon">✏️</span> Auth &amp; Data
+      </button>
+      <button class="nav-item" data-page="run">
+        <span class="icon">▶️</span> Run
+        <span class="nav-badge hidden" id="result-badge">0</span>
+      </button>
+    </nav>
+    <div class="sidebar-footer">v1.0 · 20yr Tester Edition</div>
+  </aside>
+
+  <!-- ── Main content ── -->
+  <main class="main">
+
+    <!-- ══════════ PAGE: Import Spec ══════════ -->
+    <section class="page active" id="page-import">
+      <div class="page-header">
+        <h2>Import API Specification</h2>
+        <p>Paste an OpenAPI 3.0 / Swagger 2.0 spec (JSON or YAML) or upload a file</p>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span class="dot"></span>Paste or Upload Spec</div>
+        <div class="spec-drop" id="drop-zone">
+          <div class="icon">📂</div>
+          <p>Drag &amp; drop a .json / .yaml file here, or click to browse</p>
+          <input type="file" id="file-input" accept=".json,.yaml,.yml" style="display:none"/>
+        </div>
+        <div class="form-row cols-1">
+          <div class="form-group">
+            <label>Spec content (JSON or YAML)</label>
+            <textarea id="spec-text" rows="12" placeholder='{"openapi":"3.0.0","info":{"title":"My API","version":"1.0"},"paths":{...}}'></textarea>
+          </div>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="btn-parse">🔍 Parse Spec</button>
+          <button class="btn btn-secondary" id="btn-clear-spec">Clear</button>
+        </div>
+        <div id="parse-error" class="alert alert-error hidden" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card hidden" id="spec-result">
+        <div class="card-title"><span class="dot"></span>Parsed Endpoints <span id="ep-count" class="tag"></span></div>
+        <div id="spec-info" class="alert alert-info" style="margin-bottom:12px"></div>
+        <input type="text" id="ep-search" placeholder="🔍  Filter endpoints…" style="margin-bottom:10px"/>
+        <div class="endpoint-list" id="endpoint-list"></div>
+        <div class="btn-group" style="margin-top:12px">
+          <button class="btn btn-primary" id="btn-to-chain">Configure Chain →</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════ PAGE: Configure Chain ══════════ -->
+    <section class="page" id="page-chain">
+      <div class="page-header">
+        <h2>Configure Chain</h2>
+        <p>Select CRUD endpoints for each API. API-2 is deleted first, then API-1.</p>
+      </div>
+
+      <div id="api-panels-container"></div>
+
+      <div class="card" id="chain-mapping-card">
+        <div class="card-title"><span class="dot"></span>Response → Request Mappings</div>
+        <p class="hint" style="margin-bottom:12px">Extract values from API-1 POST response and inject into API-2 POST request body using <code style="color:var(--accent)">{{variable_name}}</code> syntax.</p>
+        <table class="mapping-table" id="mapping-table">
+          <thead><tr>
+            <th>API</th>
+            <th>Extract from response (dot path)</th>
+            <th>Variable name</th>
+            <th></th>
+          </tr></thead>
+          <tbody id="mapping-tbody"></tbody>
+        </table>
+        <button class="btn btn-secondary btn-sm" id="btn-add-mapping" style="margin-top:8px">+ Add Mapping</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span class="dot"></span>Execution Options</div>
+        <div class="form-row cols-2">
+          <div class="form-group">
+            <label>Request Timeout (seconds)</label>
+            <input type="number" id="opt-timeout" value="30" min="5" max="120"/>
+          </div>
+          <div class="form-group">
+            <label>SSL Verification</label>
+            <select id="opt-ssl">
+              <option value="true">Enabled (recommended)</option>
+              <option value="false">Disabled (self-signed certs)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-group">
+        <button class="btn btn-primary" id="btn-to-data">Auth &amp; Data →</button>
+      </div>
+    </section>
+
+    <!-- ══════════ PAGE: Auth & Data ══════════ -->
+    <section class="page" id="page-data">
+      <div class="page-header">
+        <h2>Auth &amp; Request Data</h2>
+        <p>Configure authentication and fill POST request bodies (other operations are automatic)</p>
+      </div>
+
+      <!-- Auth -->
+      <div class="card">
+        <div class="card-title"><span class="dot"></span>Authentication (Global)</div>
+        <div class="form-row cols-2">
+          <div class="form-group">
+            <label>Auth Type</label>
+            <select id="auth-type">
+              <option value="none">None</option>
+              <option value="bearer">Bearer Token</option>
+              <option value="basic">Basic Auth</option>
+              <option value="api_key">API Key</option>
+            </select>
+          </div>
+        </div>
+        <div id="auth-fields-bearer" class="auth-section hidden">
+          <div class="form-row cols-1">
+            <div class="form-group">
+              <label>Bearer Token</label>
+              <input type="text" id="auth-token" placeholder="eyJhbGciOiJIUzI1NiIs… or {{api1_token}}"/>
+              <p class="hint" style="margin-top:5px">
+                Paste a static token <strong>or</strong> use
+                <code style="color:var(--accent)">{{api1_token}}</code> to auto-inject the token
+                from Auth API response at runtime.
+              </p>
+              <div id="auth-token-source-picker" style="margin-top:8px"></div>
+            </div>
+          </div>
+        </div>
+        <div id="auth-fields-basic" class="auth-section hidden">
+          <div class="form-row cols-2">
+            <div class="form-group">
+              <label>Username</label>
+              <input type="text" id="auth-username"/>
+            </div>
+            <div class="form-group">
+              <label>Password</label>
+              <input type="password" id="auth-password"/>
+            </div>
+          </div>
+        </div>
+        <div id="auth-fields-api_key" class="auth-section hidden">
+          <div class="form-row cols-3">
+            <div class="form-group">
+              <label>Key Name</label>
+              <input type="text" id="auth-key-name" placeholder="X-API-Key"/>
+            </div>
+            <div class="form-group">
+              <label>Key Value</label>
+              <input type="text" id="auth-key-value"/>
+            </div>
+            <div class="form-group">
+              <label>Send In</label>
+              <select id="auth-key-in">
+                <option value="header">Header</option>
+                <option value="query">Query Param</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- POST bodies -->
+      <div id="post-bodies-container"></div>
+
+      <div class="btn-group">
+        <button class="btn btn-success" id="btn-to-run">▶ Run Chain →</button>
+      </div>
+    </section>
+
+    <!-- ══════════ PAGE: Run ══════════ -->
+    <section class="page" id="page-run">
+      <div class="page-header">
+        <h2>Execute Chain</h2>
+        <p>Runs: POST (all APIs) → GET (all) → PUT (all) → DELETE (API-2 first, API-1 last)</p>
+      </div>
+
+      <div class="run-controls">
+        <button class="btn btn-success" id="btn-run" style="min-width:140px">
+          ▶ Run Chain
+        </button>
+        <div id="run-spinner" class="hidden"><div class="spinner"></div> Running…</div>
+        <div class="run-summary hidden" id="run-summary">
+          <span><span class="dot-success"></span> <span id="pass-count">0</span> passed</span>
+          <span><span class="dot-error"></span> <span id="fail-count">0</span> failed</span>
+        </div>
+      </div>
+
+      <div id="run-sequence"></div>
+      <div id="result-banner-container"></div>
+      <div id="results-container"></div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
