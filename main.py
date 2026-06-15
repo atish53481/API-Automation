@@ -74,13 +74,21 @@ def _make_step(
     if result["success"] and result["response_body"] is not None:
         body = result["response_body"]
 
-        # ── Auto-extract ALL scalar fields from response ──────────────────────
-        # Makes every field available as api1_fieldName in subsequent requests
-        if isinstance(body, dict):
-            for field, val in body.items():
+        # ── Recursively extract ALL scalar fields from response ───────────────
+        # Nested dicts use underscore-joined paths: booking.firstname → booking_booking_firstname
+        def _extract_scalars(obj: Any, prefix: str) -> None:
+            if not isinstance(obj, dict):
+                return
+            for field, val in obj.items():
+                key = f"{prefix}_{field}"
                 if isinstance(val, (str, int, float, bool)) or val is None:
-                    context[f"{api.id}_{field}"] = val
-                    extracted[f"{api.id}_{field}"] = val
+                    context[key] = val
+                    extracted[key] = val
+                elif isinstance(val, dict):
+                    _extract_scalars(val, key)
+
+        if isinstance(body, dict):
+            _extract_scalars(body, api.id)
 
         # ── ID field shortcut ─────────────────────────────────────────────────
         id_val = extract_value(body, api.id_field)

@@ -4,7 +4,7 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>API Chain Tester</title>
-  <link rel="stylesheet" href="/static/style.css"/>
+  <link rel="stylesheet" href="/static/style.css?v=15"/>
 </head>
 <body>
 <div class="app">
@@ -78,7 +78,7 @@
     <section class="page" id="page-chain">
       <div class="page-header">
         <h2>Configure Chain</h2>
-        <p>Select CRUD endpoints for each API. API-2 is deleted first, then API-1.</p>
+        <p>Select CRUD endpoints for each API. Delete runs in reverse order — last API deleted first, first API deleted last.</p>
       </div>
 
       <div id="api-panels-container"></div>
@@ -145,7 +145,7 @@
           <div class="form-row cols-1">
             <div class="form-group">
               <label>Bearer Token</label>
-              <input type="text" id="auth-token" placeholder="eyJhbGciOiJIUzI1NiIs… or {{api1_token}}"/>
+              <input type="text" id="auth-token" placeholder="eyJhbGciOiJIUzI1NiIs… or {{auth_token}}"/>
               <p class="hint" style="margin-top:5px">
                 Paste a static token <strong>or</strong> use
                 <code style="color:var(--accent)">{{api1_token}}</code> to auto-inject the token
@@ -222,6 +222,44 @@
   </main>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=15"></script>
+<script>
+(function() {
+  var box = null;
+  function _errBox() {
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'err-console';
+      box.style.cssText = 'position:fixed;bottom:0;left:0;right:0;max-height:200px;overflow:auto;' +
+        'background:#1a0a0a;border-top:2px solid #ff4d4d;font-family:monospace;font-size:12px;' +
+        'color:#ff6b6b;padding:8px 12px;z-index:99999;display:none';
+      var close = document.createElement('button');
+      close.textContent = '✕ Close';
+      close.style.cssText = 'float:right;background:#ff4d4d;color:#fff;border:none;padding:2px 8px;' +
+        'border-radius:3px;cursor:pointer;font-size:11px;margin-left:8px';
+      close.onclick = function() { box.style.display='none'; };
+      box.appendChild(close);
+      document.body.appendChild(box);
+    }
+    return box;
+  }
+  function _log(msg) {
+    var b = _errBox();
+    var line = document.createElement('div');
+    line.style.cssText = 'border-bottom:1px solid #330000;padding:3px 0';
+    line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+    b.insertBefore(line, b.children[1] || null);
+    b.style.display = 'block';
+  }
+  window.onerror = function(msg, src, line, col, err) {
+    _log('ERROR: ' + msg + (src ? '  @' + src.split('/').pop() + ':' + line : ''));
+    return false;
+  };
+  window.addEventListener('unhandledrejection', function(e) {
+    _log('PROMISE: ' + (e.reason?.message || e.reason));
+  });
+  window._dbg = _log; // call window._dbg('msg') from console for manual logging
+})();
+</script>
 </body>
 </html>

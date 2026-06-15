@@ -8,6 +8,164 @@ function _apiColor(idx) {
   return palette[idx % palette.length];
 }
 
+function _sanitizeId(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/^_+|_+$/g, '') || 'api';
+}
+
+const _AUTH_RESOURCES = new Set(['auth','login','token','signin','authenticate','session','oauth']);
+
+// Auto-detect the best chain key from response schema + resource name heuristics
+function _detectChainKey(apiId) {
+  const rLow   = (state.selectedResources[apiId] || '').toLowerCase();
+  const schema = state.responseSchemas[apiId];
+
+  // Auth resources always return a token
+  if (_AUTH_RESOURCES.has(rLow)) return 'token';
+
+  if (schema?.properties) {
+    const keys = Object.keys(schema.properties);
+    const find = (fn) => keys.find(k => fn(k.toLowerCase()));
+    return find(k => k === 'id')
+        || find(k => k === rLow + 'id' || k === rLow + '_id')
+        || find(k => k.endsWith('id'))
+        || find(k => ['token','access_token','key'].includes(k))
+        || keys[0]
+        || 'id';
+  }
+
+  // No schema: try resource-name + 'id' convention (e.g. booking → bookingid)
+  // Only when resource has parameterised paths (/{id})
+  const hasPathParam = (state.selections[apiId]
+    ? Object.values(state.selections[apiId]).some(p => p && p.includes('{'))
+    : false);
+  if (hasPathParam && rLow.length > 2) return rLow + 'id';
+
+  return 'id';
+}
+
+// True when this API's GET/PUT/DELETE paths contain a path param like /{id}
+function _needsChainKey(apiId) {
+  const sel = state.selections[apiId] || {};
+  return ['get','put','delete'].some(m => sel[m] && sel[m].includes('{'));
+}
+
+function _autoBootstrapFromSpec() {
+  if (!state.endpoints.length) return;
+
+  const groups    = groupByResource(state.endpoints);
+  const resources = Object.keys(groups);
+  if (!resources.length) return;
+
+  // Reset all API state to clean slate
+  state.apis              = [];
+  state.selections        = {};
+  state.baseUrls          = {};
+  state.idFields          = {};
+  state.postFields        = {};
+  state.selectedResources = {};
+  state.apiOps            = {};
+  state.apiHeaders        = {};
+  state.apiAuth           = {};
+  state.responseSchemas   = {};
+  state.putFields         = {};
+  state.mappings          = [];
+  state.executionSteps    = [];
+
+  const _find = (eps, method, wantParam) => {
+    const filt = eps.filter(e => e.method === method);
+    if (wantParam === true)  return filt.find(e =>  e.path.includes('{')) || filt[0];
+    if (wantParam === false) return filt.find(e => !e.path.includes('{')) || filt[0];
+    return filt[0];
+  };
+
+  // Auth-like resources run first so their tokens are available to all subsequent APIs
+  resources.sort((a, b) => {
+    const aA = _AUTH_RESOURCES.has(a.toLowerCase()) ? 0 : 1;
+    const bA = _AUTH_RESOURCES.has(b.toLowerCase()) ? 0 : 1;
+    return aA - bA;
+  });
+
+  resources.forEach((resource, idx) => {
+    const id   = _sanitizeId(resource);
+    const eps  = groups[resource] || [];
+    const rLow = resource.toLowerCase();
+
+    state.selections[id]        = {};
+    state.baseUrls[id]          = state.spec?.base_url || '';
+    state.idFields[id]          = '';   // resolved later by _detectChainKey in renderApiPanel
+    state.postFields[id]        = [];
+    state.selectedResources[id] = resource;
+    // Delete OFF by default — must be explicitly enabled per API
+    state.apiOps[id]            = { create:true, read:true, update:true, delete:false };
+    state.apiHeaders[id]        = [];
+    state.apiAuth[id]           = null;
+    state.responseSchemas[id]   = null;
+
+    const niceName = resource.charAt(0).toUpperCase() + resource.slice(1) + ' API';
+    state.apis.push({ id, name: niceName, colorIdx: idx });
+
+    // Auto-assign endpoints (PUT falls back to PATCH)
+    const postEp   = _find(eps, 'POST',   false);
+    const getEp    = _find(eps, 'GET',    true);
+    const putEp    = _find(eps, 'PUT',    null) || _find(eps, 'PATCH', null);
+    const deleteEp = _find(eps, 'DELETE', null);
+
+    if (postEp)   state.selections[id].post   = postEp.path;
+    if (getEp)    state.selections[id].get    = getEp.path;
+    if (putEp)    state.selections[id].put    = putEp.path;
+    if (deleteEp) state.selections[id].delete = deleteEp.path;
+
+    // Use response schema from spec when available
+    if (postEp?.response_schema) {
+      state.responseSchemas[id] = postEp.response_schema;
+    }
+
+    // Auth heuristic: spec rarely documents the token response — synthesize it
+    if (_AUTH_RESOURCES.has(rLow) && !state.responseSchemas[id]) {
+      state.responseSchemas[id] = { type:'object', properties:{ token:{ type:'string' } } };
+    }
+
+    // Body fallback: synthesize {resource}id + wrapped resource object
+    // Matches common REST pattern: POST /booking → {bookingid:1, booking:{…body fields}}
+    if (!state.responseSchemas[id] && postEp?.request_body_schema?.properties) {
+      state.responseSchemas[id] = {
+        type: 'object',
+        properties: {
+          [rLow + 'id']: { type: 'integer' },
+          [rLow]: { type: 'object', properties: { ...postEp.request_body_schema.properties } }
+        }
+      };
+    }
+
+    // Auto-populate POST body fields
+    if (postEp?.request_body_schema) {
+      state.postFields[id] = _schemaToFields(postEp.request_body_schema, id);
+    }
+
+    // Pre-populate PUT body fields from PUT schema (fall back to POST schema)
+    if (putEp) {
+      const putSchema = putEp.request_body_schema || postEp?.request_body_schema;
+      if (putSchema) state.putFields[id] = _schemaToFields(putSchema, id);
+    }
+  });
+
+  // Keep counter above highest index to avoid id collisions when user adds more APIs
+  _apiCounter = state.apis.length;
+
+  // Auto-wire bearer token from first detected auth resource
+  const authResource = resources.find(r => _AUTH_RESOURCES.has(r.toLowerCase()));
+  if (authResource) {
+    // Derive the token var: e.g. auth resource "auth" → {{auth_token}}
+    const authId       = _sanitizeId(authResource);
+    const tokenField   = (state.responseSchemas[authId]?.properties
+                          ? Object.keys(state.responseSchemas[authId].properties)[0]
+                          : 'token');
+    state._autoAuth = `{{${authId}_${tokenField}}}`;
+  } else {
+    state._autoAuth = null;
+  }
+}
+
 // postFields: apiId -> [{name, type, value, random, inject}]
 // inject: if value starts with {{, treat as context injection (disable random)
 
@@ -25,11 +183,12 @@ const state = {
   postFields:        { api1: [], api2: [] },
   selectedResources: { api1: '', api2: '' },
   // ── new generic state ──
-  apiOps:     { api1: {create:true,read:true,update:true,delete:true},
-                api2: {create:true,read:true,update:true,delete:true} },
+  apiOps:     { api1: {create:true,read:true,update:true,delete:false},
+                api2: {create:true,read:true,update:true,delete:false} },
   apiHeaders:      { api1: [], api2: [] },
   apiAuth:         { api1: null, api2: null },
   responseSchemas: { api1: null, api2: null }, // POST response schema per api (from spec)
+  putFields:       { api1: [], api2: [] },     // [{name,type,value,random}] for PUT body per api
   executionSteps:  [], // [{uid, apiId, operation, enabled}] — user-ordered step list
 };
 
@@ -39,10 +198,11 @@ function _initApiState(id, colorIdx) {
   state.idFields[id]          = 'id';
   state.postFields[id]        = [];
   state.selectedResources[id] = '';
-  state.apiOps[id]         = { create:true, read:true, update:true, delete:true };
+  state.apiOps[id]         = { create:true, read:true, update:true, delete:false };
   state.apiHeaders[id]     = [];
   state.apiAuth[id]        = null;
   state.responseSchemas[id] = null;
+  state.putFields[id]      = [];
   state.apis.push({ id, name: `API ${colorIdx + 1}`, colorIdx });
   state.executionSteps = []; // force re-generate on next Run page visit
 }
@@ -56,7 +216,7 @@ function addApi() {
 }
 
 function removeApi(apiId) {
-  if (state.apis.length <= 2) { alert('Minimum 2 APIs required.'); return; }
+  if (state.apis.length <= 1) { alert('At least 1 API required.'); return; }
   saveChainPageState();
   state.apis = state.apis.filter(a => a.id !== apiId);
   delete state.selections[apiId];
@@ -68,6 +228,7 @@ function removeApi(apiId) {
   delete state.apiHeaders[apiId];
   delete state.apiAuth[apiId];
   delete state.responseSchemas[apiId];
+  delete state.putFields[apiId];
   state.mappings = state.mappings.filter(m => m.apiId !== apiId);
   state.executionSteps = state.executionSteps.filter(s => s.apiId !== apiId);
   renderChainPage();
@@ -84,7 +245,7 @@ function moveApi(apiId, dir) {
 }
 
 function toggleOp(apiId, op, checked) {
-  if (!state.apiOps[apiId]) state.apiOps[apiId] = {create:true,read:true,update:true,delete:true};
+  if (!state.apiOps[apiId]) state.apiOps[apiId] = {create:true,read:true,update:true,delete:false};
   state.apiOps[apiId][op] = checked;
 }
 
@@ -108,23 +269,27 @@ function saveChainPageState() {
 // Return [{asVar, resourceName, apiName, fieldLabel}] from all APIs before apiId
 function _prevApiVars(apiId) {
   const myIdx = state.apis.findIndex(a => a.id === apiId);
-  const vars = [];
+  const vars  = [];
   for (let i = 0; i < myIdx; i++) {
-    const a = state.apis[i];
+    const a  = state.apis[i];
     const rn = _resourceNameOf(a.id);
-
-    // All fields from POST response schema
     const schema = state.responseSchemas[a.id];
     if (schema?.properties) {
-      Object.entries(schema.properties).forEach(([field, prop]) => {
-        vars.push({ asVar: `${a.id}_${field}`, resourceName: rn, apiName: a.name, fieldLabel: field, apiId: a.id });
-      });
+      const collectVars = (props, prefix) => {
+        Object.entries(props || {}).forEach(([field, prop]) => {
+          const t  = prop.type || (prop.properties ? 'object' : 'string');
+          const vn = `${prefix}_${field}`;
+          if (['string','integer','number','boolean'].includes(t)) {
+            vars.push({ asVar: vn, resourceName: rn, apiName: a.name, fieldLabel: field, apiId: a.id });
+          } else if (t === 'object' && prop.properties) {
+            collectVars(prop.properties, vn);
+          }
+        });
+      };
+      collectVars(schema.properties, a.id);
     } else {
-      // fallback: at minimum the id field
       vars.push({ asVar: `${a.id}_id`, resourceName: rn, apiName: a.name, fieldLabel: state.idFields[a.id] || 'id', apiId: a.id });
     }
-
-    // user-defined mappings on top
     state.mappings.filter(m => m.apiId === a.id && m.asVar)
       .forEach(m => vars.push({ asVar: m.asVar, resourceName: rn, apiName: a.name, fieldLabel: m.field, apiId: a.id }));
   }
@@ -137,16 +302,23 @@ function _resourceNameOf(apiId) {
 }
 
 // Decide injection var for a field, or null
+// Priority: resource-name ID match → direct field name match → generic 'id' fallback
 function _autoInject(fieldName, fieldType, prevVars) {
   const fl = fieldName.toLowerCase();
+  let genericIdMatch = null;
+  let directFieldMatch = null;
+
   for (const v of prevVars) {
-    const rn = v.resourceName; // e.g. "product"
-    // Exact resource ID field: productId, product_id, productid
+    const rn = v.resourceName;
+    // Highest priority: resource-scoped ID patterns (bookingId, booking_id, bookingid)
     if (rn && (fl === rn + 'id' || fl === rn + '_id' || fl === rn + 'ids')) return v.asVar;
-    // Field name is just "id" in non-first API
-    if (fl === 'id' && fieldType === 'integer') return v.asVar;
+    // Direct field name match across any previous API response (most-recent wins)
+    if (fl === v.fieldLabel.toLowerCase()) directFieldMatch = v.asVar;
+    // Generic 'id' field — any type, most-recent previous API wins
+    if (fl === 'id' || fl === '_id') genericIdMatch = v.asVar;
   }
-  return null;
+
+  return directFieldMatch || genericIdMatch || null;
 }
 
 // For array fields: build smart default using prev API id
@@ -229,30 +401,50 @@ function _sourceApiForVar(varStr) {
   return '';
 }
 
-function _schemaToFields(schema, apiId) {
+function _schemaToFields(schema, apiId, _prefix) {
   if (!schema || schema.type !== 'object' || !schema.properties) return [];
-  const prevVars = apiId ? _prevApiVars(apiId) : [];
+  const prevVars = (apiId && !_prefix) ? _prevApiVars(apiId) : [];
+  const fields   = [];
 
-  return Object.entries(schema.properties).map(([name, prop]) => {
-    const type = prop.type || 'string';
-    const fmt  = prop.format || '';
+  Object.entries(schema.properties).forEach(([name, prop]) => {
+    const type     = prop.type || 'string';
+    const fmt      = prop.format || '';
+    const fullName = _prefix ? `${_prefix}.${name}` : name;
 
-    // 1. Try auto-inject from previous API response
-    const inject = _autoInject(name, type, prevVars);
-    if (inject) return { name, type, value: `{{${inject}}}`, random: false };
-
-    // 2. Array → try smart default
-    if (type === 'array') {
-      const arr = _arrayDefault(name, prop, prevVars);
-      return { name, type, value: arr || '[]', random: false };
+    // Nested object — flatten recursively into dot-notation rows.
+    // Guard covers: explicit type:'object', OR implied object (properties present but no type).
+    if (type === 'object' || prop.properties) {
+      if (prop.properties) {
+        fields.push(..._schemaToFields(prop, null, fullName));
+      } else {
+        // object schema with no declared properties — render as editable JSON field
+        fields.push({ name: fullName, type: 'object', value: prop.example != null ? JSON.stringify(prop.example) : '{}', random: false });
+      }
+      return;
     }
 
-    // 3. Use example if present
-    if (prop.example != null) return { name, type, value: String(prop.example), random: true };
+    // 1. Auto-inject from previous API
+    const inject = prevVars.length ? _autoInject(name, type, prevVars) : null;
+    if (inject) { fields.push({ name: fullName, type, value: `{{${inject}}}`, random: false }); return; }
+
+    // 2. Array
+    if (type === 'array') {
+      const arr = _arrayDefault(name, prop, prevVars);
+      fields.push({ name: fullName, type, value: arr || '[]', random: false });
+      return;
+    }
+
+    // 3. Example value (guard against object examples becoming "[object Object]")
+    if (prop.example != null && typeof prop.example !== 'object') {
+      fields.push({ name: fullName, type, value: String(prop.example), random: true });
+      return;
+    }
 
     // 4. Auto-random
-    return { name, type, value: _randomValueForType(type, fmt), random: true };
+    fields.push({ name: fullName, type, value: _randomValueForType(type, fmt), random: true });
   });
+
+  return fields;
 }
 
 function _randomValueForType(type, fmt) {
@@ -260,6 +452,8 @@ function _randomValueForType(type, fmt) {
   if (type === 'integer') return String(Math.floor(Math.random() * 1000) + 1);
   if (type === 'number')  return String((Math.random() * 100).toFixed(2));
   if (type === 'boolean') return String(Math.random() > 0.5);
+  if (type === 'object')  return '{}';   // never produce a random string for objects
+  if (type === 'array')   return '[]';   // never produce a random string for arrays
   if (fmt === 'email')    return `user${Math.floor(Math.random()*9999)}@test.com`;
   if (fmt === 'uuid')     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random()*16|0; return (c==='x'?r:(r&0x3|0x8)).toString(16); });
@@ -315,20 +509,198 @@ function syncFieldType(apiId, idx, val) {
 function _fieldsToBody(apiId) {
   const fields = state.postFields[apiId] || [];
   const obj = {};
+
+  // Write value at dot-notation path, building nested objects as needed
+  const setNested = (target, path, val) => {
+    const parts = path.split('.');
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (typeof target[parts[i]] !== 'object' || target[parts[i]] === null)
+        target[parts[i]] = {};
+      target = target[parts[i]];
+    }
+    target[parts[parts.length - 1]] = val;
+  };
+
   for (const f of fields) {
     if (!f.name) continue;
     const raw = f.value;
-    if (raw.startsWith('{{')) { obj[f.name] = raw; continue; }
-    if (f.type === 'integer') { obj[f.name] = parseInt(raw) || 0; continue; }
-    if (f.type === 'number')  { obj[f.name] = parseFloat(raw) || 0; continue; }
-    if (f.type === 'boolean') { obj[f.name] = raw === 'true'; continue; }
-    // array/object: try JSON parse
-    if (f.type === 'array' || f.type === 'object') {
-      try { obj[f.name] = JSON.parse(raw); continue; } catch {}
+    let val;
+    if (raw.startsWith('{{'))                          val = raw;
+    else if (f.type === 'integer')                     val = parseInt(raw) || 0;
+    else if (f.type === 'number')                      val = parseFloat(raw) || 0;
+    else if (f.type === 'boolean')                     val = raw === 'true';
+    else if (f.type === 'array' || f.type === 'object') {
+      try { val = JSON.parse(raw); } catch { val = raw; }
     }
-    obj[f.name] = raw;
+    else val = raw;
+    setNested(obj, f.name, val);
   }
   return obj;
+}
+
+// ── PUT Field Editor (mirrors POST field editor) ──────────────────────────────
+function _putFieldsToBody(apiId) {
+  const fields = state.putFields[apiId] || [];
+  const obj = {};
+  const setNested = (target, path, val) => {
+    const parts = path.split('.');
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (typeof target[parts[i]] !== 'object' || target[parts[i]] === null)
+        target[parts[i]] = {};
+      target = target[parts[i]];
+    }
+    target[parts[parts.length - 1]] = val;
+  };
+  for (const f of fields) {
+    if (!f.name) continue;
+    const raw = f.value;
+    let val;
+    if (raw.startsWith('{{'))                          val = raw;
+    else if (f.type === 'integer')                     val = parseInt(raw) || 0;
+    else if (f.type === 'number')                      val = parseFloat(raw) || 0;
+    else if (f.type === 'boolean')                     val = raw === 'true';
+    else if (f.type === 'array' || f.type === 'object') { try { val = JSON.parse(raw); } catch { val = raw; } }
+    else val = raw;
+    setNested(obj, f.name, val);
+  }
+  return obj;
+}
+
+function renderPutFieldEditor(apiId) {
+  const container = document.getElementById(`put-field-editor-${apiId}`);
+  if (!container) return;
+  const fields = state.putFields[apiId] || [];
+  if (!fields.length) {
+    container.innerHTML = `<div class="hint" style="margin-bottom:8px">No fields yet. Click <strong>+ Add Field</strong> or a resource with a PUT/PATCH schema.</div>`;
+    return;
+  }
+  const TYPES = ['string','integer','number','boolean','array','object'];
+  container.innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:4px">
+      <thead>
+        <tr style="background:var(--surface2)">
+          <th style="padding:7px 10px;text-align:left;color:var(--text-dim);font-weight:700;width:26%">Field Name</th>
+          <th style="padding:7px 10px;text-align:left;color:var(--text-dim);font-weight:700;width:12%">Type</th>
+          <th style="padding:7px 10px;text-align:left;color:var(--text-dim);font-weight:700;width:20%">Source</th>
+          <th style="padding:7px 10px;text-align:left;color:var(--text-dim);font-weight:700">Value</th>
+          <th style="padding:7px 10px;width:28px"></th>
+        </tr>
+      </thead>
+      <tbody>
+        ${fields.map((f, i) => {
+          const isInject = f.value.startsWith('{{');
+          const isArray  = f.type === 'array' || f.type === 'object';
+          const srcApi   = isInject ? _sourceApiForVar(f.value) : '';
+          const rowBg    = isInject ? 'background:rgba(108,99,255,.07)' : '';
+          const valStyle = isInject
+            ? 'color:var(--accent);border-color:rgba(108,99,255,.5);font-weight:600'
+            : isArray ? 'color:var(--warning);font-size:11px' : '';
+          const srcLabel = srcApi
+            ? `<div style="font-size:10px;color:#a29bfe;margin-top:2px">⛓ from <strong>${escHtml(srcApi)}</strong></div>`
+            : '';
+          const typeBadge = isInject
+            ? `<span style="font-size:9px;background:rgba(108,99,255,.25);color:#a29bfe;padding:1px 6px;border-radius:3px;white-space:nowrap">AUTO-INJECT</span>`
+            : isArray
+              ? `<span style="font-size:9px;background:rgba(255,165,0,.2);color:var(--warning);padding:1px 6px;border-radius:3px">ARRAY</span>`
+              : '';
+          const actionCell = (!isInject && !isArray)
+            ? `<button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:13px" title="Generate random"
+                onclick="randomPutField('${apiId}',${i});document.getElementById('put-field-val-${apiId}-${i}').value=state.putFields['${apiId}'][${i}].value">🎲</button>`
+            : (isInject
+                ? `<span title="Auto-injected from previous API" style="font-size:16px;cursor:default">⛓</span>`
+                : `<span style="color:var(--text-dim)">·</span>`);
+          return `<tr style="border-bottom:1px solid rgba(46,49,71,.4);${rowBg}">
+            <td style="padding:6px 8px;vertical-align:middle">
+              <input style="font-family:var(--mono);font-size:12px" value="${escHtml(f.name)}"
+                oninput="syncPutFieldName('${apiId}',${i},this.value)" placeholder="fieldName"/>
+              ${srcLabel}
+            </td>
+            <td style="padding:5px 6px;vertical-align:middle">
+              <select style="font-size:12px;padding:5px 6px" onchange="syncPutFieldType('${apiId}',${i},this.value)">
+                ${TYPES.map(t => `<option value="${t}" ${f.type===t?'selected':''}>${t}</option>`).join('')}
+              </select>
+            </td>
+            <td style="padding:5px 6px;vertical-align:middle">
+              <select style="font-size:12px;padding:5px 6px;${isInject?'color:var(--accent);border-color:rgba(108,99,255,.4)':isArray?'color:var(--warning)':''}"
+                onchange="onPutSourceChange('${apiId}',${i},this.value)">
+                ${_sourceOptions(apiId, f.value)}
+              </select>
+              <div style="margin-top:3px">${typeBadge}</div>
+            </td>
+            <td style="padding:5px 6px;vertical-align:middle">
+              <input id="put-field-val-${apiId}-${i}"
+                style="font-family:var(--mono);font-size:12px;${valStyle}"
+                value="${escHtml(f.value)}"
+                placeholder="${isInject ? '{{var}}' : isArray ? '[{"id":"{{var}}"}]' : 'enter value'}"
+                oninput="syncPutFieldValue('${apiId}',${i},this.value)"/>
+            </td>
+            <td style="padding:5px 4px;text-align:center;vertical-align:middle">
+              <button class="btn btn-danger btn-sm" style="padding:3px 7px" onclick="removePutField('${apiId}',${i})">✕</button>
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>`;
+}
+
+function onPutSourceChange(apiId, idx, val) {
+  const f = state.putFields[apiId]?.[idx];
+  if (!f) return;
+  const inp = document.getElementById(`put-field-val-${apiId}-${idx}`);
+  if (val === '__manual__') {
+    f.value = inp ? inp.value : '';
+    if (inp) { inp.disabled = false; inp.style.color = ''; inp.style.borderColor = ''; }
+  } else if (val === '__random__') {
+    f.value = _randomValueForType(f.type);
+    f.random = true;
+    if (inp) { inp.value = f.value; inp.disabled = false; inp.style.color = 'var(--success)'; inp.style.borderColor = ''; }
+  } else if (val.startsWith('var:')) {
+    const varName = val.slice(4);
+    f.value = `{{${varName}}}`;
+    if (inp) { inp.value = f.value; inp.disabled = false; inp.style.color = 'var(--accent)'; inp.style.borderColor = 'rgba(108,99,255,.5)'; }
+  }
+}
+
+function randomPutField(apiId, idx) {
+  const f = state.putFields[apiId]?.[idx];
+  if (!f) return;
+  f.value  = _randomValueForType(f.type);
+  f.random = true;
+  const inp = document.getElementById(`put-field-val-${apiId}-${idx}`);
+  if (inp) inp.value = f.value;
+}
+
+function randomPutFields(apiId) {
+  (state.putFields[apiId] || []).forEach((f) => {
+    if (!f.value.startsWith('{{') && f.type !== 'array' && f.type !== 'object') {
+      f.value  = _randomValueForType(f.type);
+      f.random = true;
+    }
+  });
+  renderPutFieldEditor(apiId);
+}
+
+function addCustomPutField(apiId) {
+  state.putFields[apiId] = state.putFields[apiId] || [];
+  state.putFields[apiId].push({ name: '', type: 'string', value: '', random: false });
+  renderPutFieldEditor(apiId);
+}
+
+function removePutField(apiId, idx) {
+  state.putFields[apiId].splice(idx, 1);
+  renderPutFieldEditor(apiId);
+}
+
+function syncPutFieldValue(apiId, idx, val) {
+  if (state.putFields[apiId]?.[idx]) state.putFields[apiId][idx].value = val;
+}
+
+function syncPutFieldName(apiId, idx, val) {
+  if (state.putFields[apiId]?.[idx]) state.putFields[apiId][idx].name = val;
+}
+
+function syncPutFieldType(apiId, idx, val) {
+  if (state.putFields[apiId]?.[idx]) state.putFields[apiId][idx].type = val;
 }
 
 // ── Navigation ────────────────────────────────────────────────────────────────
@@ -393,9 +765,11 @@ document.getElementById('ep-search').addEventListener('input', function () {
 });
 
 document.getElementById('btn-to-chain').addEventListener('click', () => {
-  // Pre-fill base URLs from spec
-  if (state.spec?.base_url) {
-    state.apis.forEach(a => { state.baseUrls[a.id] = state.spec.base_url; });
+  // Auto-bootstrap one API slot per resource group on first visit after spec load
+  if (state.endpoints.length && state.apis.every(a => !state.selectedResources[a.id])) {
+    _autoBootstrapFromSpec();
+  } else if (state.spec?.base_url) {
+    state.apis.forEach(a => { if (!state.baseUrls[a.id]) state.baseUrls[a.id] = state.spec.base_url; });
   }
   navigateTo('chain');
 });
@@ -415,6 +789,20 @@ function renderEndpointList(spec) {
 }
 
 // ── Resource grouping ─────────────────────────────────────────────────────────
+function _renameApiId(oldId, newId) {
+  if (oldId === newId) return oldId;
+  if (state.apis.some(a => a.id === newId)) return oldId; // collision — keep original
+  const mv = (obj) => { if (oldId in obj) { obj[newId] = obj[oldId]; delete obj[oldId]; } };
+  mv(state.selections); mv(state.baseUrls); mv(state.idFields); mv(state.postFields);
+  mv(state.selectedResources); mv(state.apiOps); mv(state.apiHeaders);
+  mv(state.apiAuth); mv(state.responseSchemas); mv(state.putFields);
+  const api = state.apis.find(a => a.id === oldId);
+  if (api) api.id = newId;
+  state.executionSteps.forEach(s => { if (s.apiId === oldId) s.apiId = newId; });
+  state.mappings.forEach(m => { if (m.apiId === oldId) m.apiId = newId; });
+  return newId;
+}
+
 function groupByResource(endpoints) {
   // Group by first path segment: /products, /products/{id} → "products"
   const groups = {};
@@ -427,14 +815,13 @@ function groupByResource(endpoints) {
 }
 
 function autoAssignFromResource(resource, apiId) {
-  // Track selection for mutual exclusion
+  // Track selection on original id (DOM still uses old id at this point)
   state.selectedResources[apiId] = resource;
 
   // Refresh ALL resource dropdowns so taken resources are hidden
   refreshResourceDropdowns();
 
   if (!resource) {
-    // Clear assignments
     ['post','get','put','delete'].forEach(m => {
       const sel = document.getElementById(`sel-${apiId}-${m}`);
       if (sel) { sel.value = ''; sel.style.borderColor = ''; state.selections[apiId][m] = ''; }
@@ -457,32 +844,56 @@ function autoAssignFromResource(resource, apiId) {
   const putEp    = find('PUT',    null);
   const deleteEp = find('DELETE', null);
 
+  // Update state.selections via DOM (DOM still has old apiId)
   const assign = (method, ep) => {
     const sel = document.getElementById(`sel-${apiId}-${method}`);
     if (sel && ep) { sel.value = ep.path; state.selections[apiId][method] = ep.path; }
   };
-  assign('post',   postEp);
-  assign('get',    getEp);
-  assign('put',    putEp);
-  assign('delete', deleteEp);
+  assign('post', postEp); assign('get', getEp); assign('put', putEp); assign('delete', deleteEp);
 
-  // Auto-name
+  // Auto-name (DOM still has old apiId)
   const niceName = resource.charAt(0).toUpperCase() + resource.slice(1) + ' API';
   const nameEl = document.getElementById(`api-name-${apiId}`);
   if (nameEl) { nameEl.value = niceName; updateApiName(apiId, niceName); }
 
-  // Green border on assigned
   ['post','get','put','delete'].forEach(m => {
     const sel = document.getElementById(`sel-${apiId}-${m}`);
     if (sel) sel.style.borderColor = sel.value ? 'var(--success)' : '';
   });
 
-  // Store POST response schema for source picker
-  if (postEp?.response_schema) state.responseSchemas[apiId] = postEp.response_schema;
+  // Rename generic API ID (api1, api2, api3…) to resource name — gives clean {{booking_xxx}} vars
+  if (/^api\d+$/.test(apiId) && resource) {
+    apiId = _renameApiId(apiId, _sanitizeId(resource));
+  }
 
-  // Auto-populate postFields from POST request body schema
-  if (postEp?.request_body_schema)
+  // Response schema: spec → auth heuristic → body-fallback (wraps body under resource key)
+  const rLow = resource.toLowerCase();
+  if (postEp?.response_schema) {
+    state.responseSchemas[apiId] = postEp.response_schema;
+  } else if (_AUTH_RESOURCES.has(rLow)) {
+    state.responseSchemas[apiId] = { type:'object', properties:{ token:{ type:'string' } } };
+  } else if (postEp?.request_body_schema?.properties) {
+    // Matches common REST pattern: POST /booking → {bookingid:1, booking:{…body fields}}
+    state.responseSchemas[apiId] = {
+      type: 'object',
+      properties: {
+        [rLow + 'id']: { type: 'integer' },
+        [rLow]: { type: 'object', properties: { ...postEp.request_body_schema.properties } }
+      }
+    };
+  }
+
+  if (postEp?.request_body_schema) {
     state.postFields[apiId] = _schemaToFields(postEp.request_body_schema, apiId);
+  }
+
+  // Pre-populate PUT body fields from PUT schema (fall back to POST schema)
+  if (putEp) {
+    const putSchema = putEp?.request_body_schema || postEp?.request_body_schema;
+    if (putSchema) state.putFields[apiId] = _schemaToFields(putSchema, apiId);
+  }
+
+  renderChainPage();
 }
 
 function refreshResourceDropdowns() {
@@ -560,7 +971,7 @@ function renderApiPanel(api) {
   };
 
   const accentColor = _apiColor(api.colorIdx);
-  const canRemove = state.apis.length > 2;
+  const canRemove = state.apis.length > 1;
   const myIdx     = state.apis.findIndex(a => a.id === api.id);
   const canUp     = myIdx > 0;
   const canDown   = myIdx < state.apis.length - 1;
@@ -627,28 +1038,41 @@ function renderApiPanel(api) {
           <select id="sel-${api.id}-delete">${epOptions('DELETE')}</select>
         </div>
       </div>
-      <div class="form-row cols-2">
-        <div class="form-group">
-          <label>ID field in POST response</label>
-          <input type="text" id="id-field-${api.id}" value="${state.idFields[api.id]||'id'}" placeholder="id"/>
-          <p class="hint">Field in response body holding resource ID (e.g. "id", "data.id")</p>
-        </div>
-      </div>
+      <!-- Chain key: fully auto-detected, hidden from user -->
+      ${(() => {
+        const key = _detectChainKey(api.id);
+        state.idFields[api.id] = key;
+        return `<input type="hidden" id="id-field-${api.id}" value="${key}"/>`;
+      })()}
 
-      <!-- Operation toggles -->
+      <!-- Operation toggles — greyed when no endpoint configured -->
       <div style="margin-top:4px">
         <label style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;display:block;margin-bottom:8px">Operations to Execute</label>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
           ${['create','read','update','delete'].map(op => {
-            const icons = {create:'🟣 CREATE',read:'🟢 READ',update:'🟡 UPDATE',delete:'🔴 DELETE'};
-            const checked = (state.apiOps[api.id]?.[op] !== false) ? 'checked' : '';
-            return `<label style="display:flex;align-items:center;gap:6px;cursor:pointer;background:var(--surface2);border:1px solid var(--border);padding:6px 12px;border-radius:7px;font-size:12px;font-weight:600;user-select:none">
-              <input type="checkbox" id="op-${api.id}-${op}" ${checked} onchange="toggleOp('${api.id}','${op}',this.checked)" style="width:14px;height:14px"/>
+            const icons  = {create:'🟣 CREATE',read:'🟢 READ',update:'🟡 UPDATE',delete:'🔴 DELETE'};
+            const epKey  = {create:'post',read:'get',update:'put',delete:'delete'}[op];
+            const hasEp  = !!state.selections[api.id]?.[epKey];
+            const checked = hasEp && (state.apiOps[api.id]?.[op] !== false) ? 'checked' : '';
+            return `<label style="display:flex;align-items:center;gap:6px;
+              cursor:${hasEp?'pointer':'not-allowed'};
+              background:var(--surface2);
+              border:1px solid ${hasEp?'var(--border)':'transparent'};
+              padding:6px 12px;border-radius:7px;font-size:12px;font-weight:600;
+              user-select:none;${hasEp?'':'opacity:.35'}">
+              <input type="checkbox" id="op-${api.id}-${op}"
+                ${checked} ${hasEp?'':'disabled'}
+                onchange="toggleOp('${api.id}','${op}',this.checked)"
+                style="width:14px;height:14px"/>
               ${icons[op]}
+              ${!hasEp?'<span style="font-size:9px;margin-left:2px">(no endpoint)</span>':''}
             </label>`;
           }).join('')}
         </div>
       </div>
+
+      <!-- POST response exports: variables available to downstream APIs -->
+      ${_renderContextOutput(api.id)}
     </div>
   </div>`;
 }
@@ -681,7 +1105,8 @@ function renderMappingTable() {
 }
 
 document.getElementById('btn-add-mapping').addEventListener('click', () => {
-  state.mappings.push({ apiId: state.apis[0].id, field: 'id', asVar: 'api1_id' });
+  const firstId = state.apis[0]?.id || 'api1';
+  state.mappings.push({ apiId: firstId, field: 'id', asVar: `${firstId}_id` });
   renderMappingTable();
 });
 
@@ -695,12 +1120,12 @@ function bindChainEvents() {
     document.getElementById(`base-url-${a.id}`)?.addEventListener('change', function() {
       state.baseUrls[a.id] = this.value;
     });
-    document.getElementById(`id-field-${a.id}`)?.addEventListener('change', function() {
-      state.idFields[a.id] = this.value;
-    });
+    // Any endpoint change → re-render panel (updates op toggles + re-runs _detectChainKey)
     ['post','get','put','delete'].forEach(m => {
       document.getElementById(`sel-${a.id}-${m}`)?.addEventListener('change', function() {
         state.selections[a.id][m] = this.value;
+        saveChainPageState();
+        renderChainPage();
       });
     });
   });
@@ -729,39 +1154,128 @@ document.getElementById('auth-type').addEventListener('change', function() {
   if (this.value === 'bearer') renderAuthTokenPicker();
 });
 
-function renderAuthTokenPicker() {
-  const pickerEl = document.getElementById('auth-token-source-picker');
-  if (!pickerEl) return;
-
-  // Collect all scalar response fields from all configured APIs
+// ── Shared: all {{vars}} from all APIs (recursive into nested schemas) ────────
+function _allApiVars() {
   const vars = [];
   const seen = new Set();
   state.apis.forEach(a => {
     const schema = state.responseSchemas[a.id];
-    if (schema?.properties) {
-      Object.entries(schema.properties).forEach(([field, prop]) => {
-        const t = prop.type || 'string';
-        if (['string', 'integer', 'number', 'boolean'].includes(t)) {
-          const vn = `${a.id}_${field}`;
-          if (!seen.has(vn)) { seen.add(vn); vars.push({ varName: vn, apiName: a.name, field }); }
-        }
+    const add = (vn, field) => {
+      if (!seen.has(vn)) { seen.add(vn); vars.push({ varName: vn, apiName: a.name, field }); }
+    };
+    const collect = (props, prefix) => {
+      Object.entries(props || {}).forEach(([field, prop]) => {
+        const t  = prop.type || (prop.properties ? 'object' : 'string');
+        const vn = `${prefix}_${field}`;
+        if (['string','integer','number','boolean'].includes(t)) add(vn, field);
+        else if (t === 'object' && prop.properties) collect(prop.properties, vn);
       });
-    }
-    // fallback: idField
+    };
+    if (schema?.properties) collect(schema.properties, a.id);
     const idF = state.idFields[a.id] || 'id';
-    const vn = `${a.id}_${idF}`;
-    if (!seen.has(vn)) { seen.add(vn); vars.push({ varName: vn, apiName: a.name, field: idF }); }
+    add(`${a.id}_${idF}`, idF);
+  });
+  return vars;
+}
+
+// ── {{var}} autocomplete dropdown (Postman-style) ─────────────────────────────
+(function() {
+  let _dd = null, _tgt = null;
+
+  function _dropdown() {
+    if (!_dd) {
+      _dd = document.createElement('div');
+      _dd.id = 'var-ac-drop';
+      _dd.style.cssText = 'position:fixed;z-index:99998;background:#1a1a2e;' +
+        'border:1px solid rgba(108,99,255,.5);border-radius:8px;' +
+        'box-shadow:0 8px 32px rgba(0,0,0,.6);max-height:220px;overflow-y:auto;' +
+        'min-width:280px;display:none;font-size:12px';
+      document.body.appendChild(_dd);
+    }
+    return _dd;
+  }
+
+  function _hide() { _dropdown().style.display = 'none'; _tgt = null; }
+
+  function _show(inp, query) {
+    _tgt = inp;
+    const vars    = _allApiVars();
+    const q       = query.toLowerCase();
+    const matches = vars.filter(v =>
+      !q || v.varName.toLowerCase().includes(q) || v.apiName.toLowerCase().includes(q)
+    );
+    if (!matches.length) { _hide(); return; }
+    const d    = _dropdown();
+    const rect = inp.getBoundingClientRect();
+    d.style.top   = (rect.bottom + window.scrollY + 4) + 'px';
+    d.style.left  = rect.left + 'px';
+    d.style.width = Math.max(rect.width, 280) + 'px';
+    d.innerHTML   = matches.map(v =>
+      `<div class="_vac" data-v="${v.varName}"
+        style="padding:8px 14px;cursor:pointer;display:flex;justify-content:space-between;
+               align-items:center;gap:10px;border-bottom:1px solid rgba(255,255,255,.04)">
+        <code style="color:#6c63ff;font-size:12px">{{${v.varName}}}</code>
+        <span style="font-size:10px;color:#888;flex-shrink:0">${escHtml(v.apiName)}&nbsp;·&nbsp;${escHtml(v.field)}</span>
+      </div>`
+    ).join('');
+    d.querySelectorAll('._vac').forEach(row => {
+      row.onmouseenter = () => row.style.background = 'rgba(108,99,255,.18)';
+      row.onmouseleave = () => row.style.background = '';
+      row.onmousedown  = e => {
+        e.preventDefault();
+        _insert(inp, v.varName);
+        _hide();
+      };
+      // capture varName in closure
+      const vn = row.dataset.v;
+      row.onmousedown = e => { e.preventDefault(); _insert(inp, vn); _hide(); };
+    });
+    d.style.display = 'block';
+  }
+
+  function _insert(inp, varName) {
+    const v   = inp.value;
+    const pos = inp.selectionStart ?? v.length;
+    const pre = v.slice(0, pos);
+    const bi  = pre.lastIndexOf('{{');
+    const start = bi === -1 ? pos : bi;
+    inp.value = v.slice(0, start) + `{{${varName}}}` + v.slice(pos);
+    inp.style.color = '#6c63ff';
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    const cur = start + varName.length + 4;
+    inp.setSelectionRange(cur, cur);
+    inp.focus();
+  }
+
+  function _onInput(e) {
+    const inp = e.target;
+    const pre = inp.value.slice(0, inp.selectionStart ?? inp.value.length);
+    const bi  = pre.lastIndexOf('{{');
+    if (bi === -1 || pre.indexOf('}}', bi) !== -1) { _hide(); return; }
+    _show(inp, pre.slice(bi + 2));
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const tok = document.getElementById('auth-token');
+    if (tok) tok.addEventListener('input', _onInput);
+    document.addEventListener('mousedown', e => { if (_dd && !_dd.contains(e.target)) _hide(); });
+    document.addEventListener('keydown',   e => { if (e.key === 'Escape') _hide(); });
   });
 
-  if (!vars.length) { pickerEl.innerHTML = ''; return; }
+  window._wireVarAC = el => { if (el) el.addEventListener('input', _onInput); };
+})();
 
-  pickerEl.innerHTML = `
-    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+function renderAuthTokenPicker() {
+  const pickerEl = document.getElementById('auth-token-source-picker');
+  if (!pickerEl) return;
+  const vars = _allApiVars();
+  if (!vars.length) { pickerEl.innerHTML = ''; return; }
+  pickerEl.innerHTML =
+    `<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px">
       <span style="font-size:11px;color:var(--text-dim);font-weight:700;text-transform:uppercase;letter-spacing:.5px">Quick fill:</span>
-      ${vars.map(v => `
-        <button class="btn btn-secondary btn-sm"
+      ${vars.map(v =>
+        `<button class="btn btn-secondary btn-sm"
           style="font-family:var(--mono);font-size:11px;padding:3px 10px;color:var(--accent);border-color:rgba(108,99,255,.4)"
-          title="Set bearer token to {{${v.varName}}} from ${v.apiName}"
           onclick="setAuthTokenVar('${v.varName}')">
           {{${v.varName}}}
           <span style="font-size:9px;color:var(--text-dim);margin-left:4px">[${escHtml(v.apiName)}]</span>
@@ -777,13 +1291,101 @@ function setAuthTokenVar(varName) {
   inp.style.borderColor = 'rgba(108,99,255,.5)';
 }
 
+function _renderContextOutput(apiId) {
+  const schema   = state.responseSchemas[apiId];
+  const idF      = state.idFields[apiId] || 'id';
+  const chips    = [];
+  const seenVars = new Set();
+
+  const mkChip = (vn) =>
+    `<span style="background:rgba(0,217,163,.1);border:1px solid rgba(0,217,163,.3);color:#00d9a3;` +
+    `padding:3px 10px;border-radius:4px;font-family:var(--mono);font-size:11px">{{${vn}}}</span>`;
+
+  const collect = (props, prefix) => {
+    Object.entries(props || {}).forEach(([field, prop]) => {
+      const t  = prop.type || (prop.properties ? 'object' : 'string');
+      const vn = `${prefix}_${field}`;
+      if (['string','integer','number','boolean'].includes(t)) {
+        if (!seenVars.has(vn)) { seenVars.add(vn); chips.push(mkChip(vn)); }
+      } else if (t === 'object' && prop.properties) {
+        collect(prop.properties, vn);
+      }
+    });
+  };
+
+  if (schema?.properties) collect(schema.properties, apiId);
+
+  // ID shortcut chip — only show when the resolved id field isn't already a chip
+  const idFieldVar = `${apiId}_${idF}`;
+  const idChipHtml = `<span style="background:rgba(108,99,255,.12);border:1px solid rgba(108,99,255,.35);` +
+    `color:#a29bfe;padding:3px 10px;border-radius:4px;font-family:var(--mono);font-size:11px">` +
+    `{{${apiId}_id}} <span style="font-size:9px;opacity:.7">(from&nbsp;${idF})</span></span>`;
+
+  const body = chips.length
+    ? chips.join(' ') + (seenVars.has(idFieldVar) ? '' : ' ' + idChipHtml)
+    : `<span style="color:var(--text-dim);font-size:11px">All scalar response fields auto-extracted as ` +
+      `<code style="color:var(--accent)">{{${apiId}_{field}}}</code> + ` +
+      `<code style="color:#a29bfe">{{${apiId}_id}}</code></span>`;
+
+  return `<div style="margin-top:14px;padding:10px 14px;background:rgba(0,217,163,.04);` +
+    `border:1px dashed rgba(0,217,163,.25);border-radius:8px">` +
+    `<div style="font-size:10px;font-weight:700;color:#00d9a3;text-transform:uppercase;` +
+    `letter-spacing:.7px;margin-bottom:7px">⬇ Exports to next APIs after POST</div>` +
+    `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">${body}</div></div>`;
+}
+
+function _schemaToJsonStr(schema) {
+  const fields = _schemaToFields(schema, null); // null apiId = no auto-inject from prior APIs
+  const obj = {};
+  const setNested = (target, path, val) => {
+    const parts = path.split('.');
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (typeof target[parts[i]] !== 'object' || target[parts[i]] === null)
+        target[parts[i]] = {};
+      target = target[parts[i]];
+    }
+    target[parts[parts.length - 1]] = val;
+  };
+  for (const f of fields) {
+    if (!f.name) continue;
+    let val;
+    const raw = f.value;
+    if (f.type === 'integer')                      val = parseInt(raw) || 0;
+    else if (f.type === 'number')                  val = parseFloat(raw) || 0;
+    else if (f.type === 'boolean')                 val = raw === 'true';
+    else if (f.type === 'array' || f.type === 'object') { try { val = JSON.parse(raw); } catch { val = raw; } }
+    else                                           val = raw;
+    setNested(obj, f.name, val);
+  }
+  return JSON.stringify(obj, null, 2);
+}
+
 function renderDataPage() {
+  // Auto-apply bearer token from detected auth API (runs once after bootstrap)
+  if (state._autoAuth) {
+    const typeEl  = document.getElementById('auth-type');
+    const tokenEl = document.getElementById('auth-token');
+    if (typeEl && tokenEl) {
+      typeEl.value = 'bearer';
+      typeEl.dispatchEvent(new Event('change')); // shows bearer section + rerenders picker
+      tokenEl.value              = state._autoAuth;
+      tokenEl.style.color        = 'var(--accent)';
+      tokenEl.style.borderColor  = 'rgba(108,99,255,.5)';
+    }
+    state._autoAuth = null; // apply once only
+  }
   renderAuthTokenPicker();
   const container = document.getElementById('post-bodies-container');
   container.innerHTML = state.apis.map(a => {
     const ep    = state.selections[a.id]?.post;
     const color = _apiColor(a.colorIdx);
-    const injVars = state.mappings.filter(m => m.apiId !== a.id && m.asVar).map(m => m.asVar);
+    // All vars from previous APIs (auto-extracted + user mappings), deduplicated
+    const _seenVars = new Set();
+    const injVars = _prevApiVars(a.id).filter(v => {
+      if (_seenVars.has(v.asVar)) return false;
+      _seenVars.add(v.asVar);
+      return true;
+    });
     return `
     <div class="card" style="border-left:3px solid ${color}">
       <div class="card-title">
@@ -793,8 +1395,19 @@ function renderDataPage() {
       </div>
       ${injVars.length ? `
         <div class="alert alert-info" style="margin-bottom:12px">
-          Inject from previous APIs — click to copy:
-          ${injVars.map(v=>`<code style="color:var(--accent);cursor:pointer;margin:0 4px" onclick="copyVar('{{${v}}}')" title="Click to copy">{{${v}}}</code>`).join('')}
+          <span style="font-size:10px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px">Context from previous APIs — click to inject:</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+            ${injVars.map(v => `
+              <span style="display:inline-flex;flex-direction:column;align-items:flex-start;
+                background:rgba(108,99,255,.1);border:1px solid rgba(108,99,255,.3);
+                border-radius:5px;padding:4px 8px;cursor:pointer"
+                onclick="copyVar('{{${v.asVar}}}')" title="Click to copy {{${v.asVar}}}">
+                <code style="color:var(--accent);font-size:11px">{{${v.asVar}}}</code>
+                <span style="font-size:9px;color:var(--text-dim);margin-top:1px">
+                  ${escHtml(v.apiName)}&nbsp;·&nbsp;${escHtml(v.fieldLabel)}
+                </span>
+              </span>`).join('')}
+          </div>
         </div>` : ''}
       <div id="field-editor-${a.id}"></div>
       <div class="btn-group" style="margin-top:10px">
@@ -806,6 +1419,27 @@ function renderDataPage() {
         <pre id="json-pre-${a.id}" style="background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:10px;font-size:11px;font-family:var(--mono);max-height:200px;overflow:auto;white-space:pre-wrap;color:var(--text)"></pre>
       </div>
 
+      <!-- Context output: variables this API exports to the chain -->
+      ${_renderContextOutput(a.id)}
+    </div>
+
+    ${state.selections[a.id]?.put ? `
+    <div class="card" style="border-left:3px solid ${color}">
+      <div class="card-title">
+        <span class="dot" style="background:${color}"></span>
+        ${a.name} — PUT Request Body
+        <span class="tag" style="margin-left:8px">${state.selections[a.id].put}</span>
+      </div>
+      <p class="hint" style="margin-bottom:8px">
+        Edit the PUT body. Use <code style="color:var(--accent)">{{var}}</code> to inject values from previous API responses.
+        Leave fields empty to omit them.
+      </p>
+      <div id="put-field-editor-${a.id}"></div>
+      <div class="btn-group" style="margin-top:10px">
+        <button class="btn btn-secondary btn-sm" onclick="randomPutFields('${a.id}')">🎲 Random All</button>
+        <button class="btn btn-secondary btn-sm" onclick="addCustomPutField('${a.id}')">＋ Add Field</button>
+      </div>
+
       <!-- Custom headers -->
       <div style="margin-top:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
@@ -814,12 +1448,24 @@ function renderDataPage() {
         </div>
         <div id="headers-${a.id}"></div>
       </div>
-    </div>`;
+    </div>` : `
+    <div class="card" style="border-left:3px solid ${color}">
+      <!-- Custom headers (no PUT endpoint) -->
+      <div class="card-title"><span class="dot" style="background:${color}"></span>${a.name} — Headers</div>
+      <div style="margin-top:4px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <label style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px">Custom Headers</label>
+          <button class="btn btn-secondary btn-sm" onclick="addHeader('${a.id}')">＋ Add Header</button>
+        </div>
+        <div id="headers-${a.id}"></div>
+      </div>
+    </div>`}
+    `;
   }).join('');
 
   state.apis.forEach(a => {
     renderHeaders(a.id);
-    // auto-populate fields from schema if empty
+    // auto-populate POST fields from schema if empty
     if (!state.postFields[a.id]?.length) {
       const ep     = state.selections[a.id]?.post;
       const epData = ep ? state.endpoints.find(e => e.method === 'POST' && e.path === ep) : null;
@@ -827,7 +1473,28 @@ function renderDataPage() {
         state.postFields[a.id] = _schemaToFields(epData.request_body_schema, a.id);
     }
     renderFieldEditor(a.id);
+    if (window._wireVarAC) {
+      (state.postFields[a.id] || []).forEach((_, i) => {
+        window._wireVarAC(document.getElementById(`field-val-${a.id}-${i}`));
+      });
+    }
+    // auto-populate PUT fields from schema if empty
+    if (!state.putFields[a.id]?.length && state.selections[a.id]?.put) {
+      const putEpPath = state.selections[a.id].put;
+      const putEpData = state.endpoints.find(e => (e.method === 'PUT' || e.method === 'PATCH') && e.path === putEpPath);
+      const postEpPath = state.selections[a.id]?.post;
+      const postEpData = postEpPath ? state.endpoints.find(e => e.method === 'POST' && e.path === postEpPath) : null;
+      const schema = putEpData?.request_body_schema || postEpData?.request_body_schema;
+      if (schema) state.putFields[a.id] = _schemaToFields(schema, a.id);
+    }
+    renderPutFieldEditor(a.id);
+    if (window._wireVarAC) {
+      (state.putFields[a.id] || []).forEach((_, i) => {
+        window._wireVarAC(document.getElementById(`put-field-val-${a.id}-${i}`));
+      });
+    }
   });
+  window._wireVarAC && window._wireVarAC(document.getElementById('auth-token'));
 }
 
 // ── Custom Headers ────────────────────────────────────────────────────────────
@@ -1031,6 +1698,7 @@ function buildChainConfig() {
     if (!baseUrl) throw new Error(`Base URL missing for ${a.name}`);
 
     const postBody = _fieldsToBody(a.id);
+    const putBody  = sel.put ? _putFieldsToBody(a.id) : null;
 
     const extracts = state.mappings
       .filter(m => m.apiId === a.id && m.field && m.asVar)
@@ -1052,6 +1720,7 @@ function buildChainConfig() {
       put_endpoint:    sel.put    ? { path: sel.put,    method: 'PUT'    } : null,
       delete_endpoint: sel.delete ? { path: sel.delete, method: 'DELETE' } : null,
       post_body: postBody,
+      put_body: putBody,
       id_field: state.idFields[a.id] || 'id',
       response_extracts: extracts,
       custom_headers: customHeaders,
@@ -1088,23 +1757,29 @@ const _opMeta = {
 function _buildDefaultSteps() {
   _execStepUid = 0;
   const steps = [];
-  const mk = (apiId, op) => ({ uid: _execStepUid++, apiId, operation: op, enabled: true });
+  // enabled flag mirrors the ops toggle; delete uses false-by-default
+  const mk = (apiId, op) => ({
+    uid: _execStepUid++,
+    apiId,
+    operation: op,
+    enabled: state.apiOps[apiId]?.[op] !== false,
+  });
 
+  // CREATE — forward order (API 1 first, so its id is available to API 2+)
   state.apis.forEach(a => {
-    if (state.apiOps[a.id]?.create !== false && state.selections[a.id]?.post)
-      steps.push(mk(a.id, 'create'));
+    if (state.selections[a.id]?.post) steps.push(mk(a.id, 'create'));
   });
+  // READ — forward order
   state.apis.forEach(a => {
-    if (state.apiOps[a.id]?.read !== false && state.selections[a.id]?.get)
-      steps.push(mk(a.id, 'read'));
+    if (state.selections[a.id]?.get) steps.push(mk(a.id, 'read'));
   });
+  // UPDATE — forward order
   state.apis.forEach(a => {
-    if (state.apiOps[a.id]?.update !== false && state.selections[a.id]?.put)
-      steps.push(mk(a.id, 'update'));
+    if (state.selections[a.id]?.put) steps.push(mk(a.id, 'update'));
   });
+  // DELETE — REVERSE order: last API first, API 1 last (safe teardown)
   [...state.apis].reverse().forEach(a => {
-    if (state.apiOps[a.id]?.delete !== false && state.selections[a.id]?.delete)
-      steps.push(mk(a.id, 'delete'));
+    if (state.selections[a.id]?.delete) steps.push(mk(a.id, 'delete'));
   });
   return steps;
 }
@@ -1229,30 +1904,90 @@ function renderStep(step, i) {
         ).join('')}
        </div>` : '';
 
+  // ── Request headers ──────────────────────────────────────────────────────────
+  const hdrs = step.request_headers || {};
+  const hdrRows = Object.keys(hdrs).length
+    ? Object.entries(hdrs).map(([k, v]) => {
+        const isAuth = k.toLowerCase().includes('auth') || k.toLowerCase().includes('cookie') || k.toLowerCase() === 'token';
+        return `<div style="font-size:11px;font-family:var(--mono);padding:2px 0;border-bottom:1px solid rgba(46,49,71,.3)">
+          <span style="${isAuth ? 'color:var(--accent);font-weight:700' : 'color:var(--text-dim)'}">${escHtml(k)}</span>:
+          <span style="color:var(--text)">${escHtml(String(v))}</span>
+        </div>`;
+      }).join('')
+    : `<div style="font-size:11px;color:var(--text-dim);font-style:italic">No headers captured</div>`;
+
+  // ── cURL equivalent ──────────────────────────────────────────────────────────
+  const curlHdrs = Object.entries(hdrs).map(([k,v]) => `  -H '${escHtml(k)}: ${escHtml(String(v))}'`).join(' \\\n');
+  const curlBody = step.request_body
+    ? ` \\\n  -d '${escHtml(JSON.stringify(step.request_body))}'`
+    : '';
+  const curlCmd = `curl -X ${step.method} '${escHtml(step.url)}'${curlHdrs ? ' \\\n' + curlHdrs : ''}${curlBody}`;
+
+  // ── 4xx hint ─────────────────────────────────────────────────────────────────
+  let hintHtml = '';
+  if (step.status_code === 403) {
+    hintHtml = `<div style="margin:8px 0;padding:10px 14px;background:rgba(255,71,87,.08);border:1px solid rgba(255,71,87,.35);border-radius:7px;font-size:12px">
+      <div style="font-weight:700;color:var(--error);margin-bottom:6px">⛔ 403 Forbidden — likely causes:</div>
+      <ul style="margin:0;padding-left:18px;color:var(--text-dim);line-height:1.7">
+        <li>Auth token not in request — check Request Headers below; Authorization must be present</li>
+        <li>Wrong token format — restful-booker PUT/DELETE needs <code style="color:var(--accent)">Cookie: token=xxx</code>, not Bearer</li>
+        <li>Token expired — run the chain again to get a fresh token</li>
+        <li>Endpoint requires different auth — add a custom header <code style="color:var(--accent)">Cookie: token={{auth_token}}</code> in Auth &amp; Data → Custom Headers</li>
+      </ul>
+    </div>`;
+  } else if (step.status_code === 401) {
+    hintHtml = `<div style="margin:8px 0;padding:10px 14px;background:rgba(255,71,87,.08);border:1px solid rgba(255,71,87,.35);border-radius:7px;font-size:12px">
+      <div style="font-weight:700;color:var(--error);margin-bottom:4px">🔒 401 Unauthorized — token missing or invalid</div>
+      <div style="color:var(--text-dim)">Check the Authorization header in Request Headers below.</div>
+    </div>`;
+  }
+
   const reqBodyHtml = step.request_body
-    ? `<h4>Request Body</h4><pre>${jsonStr(step.request_body)}</pre>` : '';
+    ? `<div style="margin-top:10px"><div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Request Body</div><pre style="margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap">${jsonStr(step.request_body)}</pre></div>` : '';
 
   const respBodyHtml = step.response_body !== null && step.response_body !== undefined
-    ? `<h4>Response Body</h4><pre>${jsonStr(step.response_body)}</pre>` : '';
+    ? `<div style="margin-top:10px"><div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Response Body</div><pre style="margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap">${jsonStr(step.response_body)}</pre></div>` : '';
 
   const errorHtml = step.error
-    ? `<h4>Error</h4><pre style="color:var(--error)">${escHtml(step.error)}</pre>` : '';
+    ? `<div style="margin-top:8px"><pre style="color:var(--error);font-size:12px;margin:0">${escHtml(step.error)}</pre></div>` : '';
+
+  const uid = `step-${i}`;
+  const bodyHidden = step.success ? 'hidden' : '';
 
   return `
   <div class="step-result ${cls}">
-    <div class="step-header">
+    <div class="step-header" onclick="document.getElementById('${uid}').classList.toggle('hidden')" style="cursor:pointer;user-select:none">
       <span class="step-status" style="background:${statusColor}"></span>
       <span class="step-label">${escHtml(step.step)}</span>
       <span class="method-badge method-${step.method}">${step.method}</span>
       <span class="step-url">${escHtml(step.url)}</span>
       ${step.status_code ? `<span class="step-code ${codeClass}">${step.status_code}</span>` : ''}
-      <span class="step-time">${step.duration_ms ? step.duration_ms + 'ms' : '—'}</span>
+      <span class="step-time">${step.duration_ms ? step.duration_ms.toFixed(0) + 'ms' : '—'}</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--text-dim)">▼ inspect</span>
     </div>
-    <div class="step-body">
-      ${extractedHtml ? `<h4>Extracted Variables</h4>${extractedHtml}` : ''}
+    <div id="${uid}" class="step-body ${bodyHidden}">
+      ${hintHtml}
+      ${extractedHtml ? `<div style="margin-bottom:8px"><div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Extracted Variables</div>${extractedHtml}</div>` : ''}
+
+      <details ${!step.success ? 'open' : ''} style="margin-top:4px">
+        <summary style="cursor:pointer;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;list-style:none">
+          🔑 Request Headers <span style="font-weight:400;color:var(--text-dim)">(${Object.keys(hdrs).length} sent)</span>
+        </summary>
+        <div style="margin-top:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px">
+          ${hdrRows}
+        </div>
+      </details>
+
       ${reqBodyHtml}
       ${respBodyHtml}
       ${errorHtml}
+
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;list-style:none">
+          📋 cURL command (copy to test manually)
+        </summary>
+        <pre style="margin-top:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto">${curlCmd}</pre>
+      </details>
     </div>
   </div>`;
 }
@@ -1321,6 +2056,47 @@ function buildReportHtml(result) {
     const reqBody  = step.request_body  ? JSON.stringify(step.request_body,  null, 2) : null;
     const respBody = step.response_body != null ? JSON.stringify(step.response_body, null, 2) : null;
     const extracts = Object.entries(step.extracted || {});
+    const hdrs     = step.request_headers || {};
+
+    // Request headers rows
+    const hdrRowsHtml = Object.keys(hdrs).length
+      ? Object.entries(hdrs).map(([k, v]) => {
+          const isAuth = k.toLowerCase().includes('auth') || k.toLowerCase().includes('cookie') || k.toLowerCase() === 'token';
+          return `<tr>
+            <td style="padding:4px 10px;font-family:monospace;font-size:11px;color:${isAuth ? '#a29bfe' : '#8b8fa8'};font-weight:${isAuth ? '700' : '400'};border-bottom:1px solid #2e3147;white-space:nowrap">${h(k)}</td>
+            <td style="padding:4px 10px;font-family:monospace;font-size:11px;color:#e4e6f1;border-bottom:1px solid #2e3147;word-break:break-all">${h(String(v))}</td>
+          </tr>`;
+        }).join('')
+      : `<tr><td colspan="2" style="padding:6px 10px;color:#555;font-style:italic;font-size:11px">No headers captured</td></tr>`;
+
+    // cURL command
+    const curlHdrs = Object.entries(hdrs).map(([k,v]) => `  -H '${h(k)}: ${h(String(v))}'`).join(' \\\n');
+    const curlBody = step.request_body ? ` \\\n  -d '${h(JSON.stringify(step.request_body))}'` : '';
+    const curlCmd  = `curl -X ${step.method} '${h(step.url)}'${curlHdrs ? ' \\\n' + curlHdrs : ''}${curlBody}`;
+
+    // 4xx root cause hint
+    let hintHtml = '';
+    if (sc === 403) {
+      hintHtml = `<div style="flex:0 0 100%;padding:10px 14px;background:#2b0d0d;border:1px solid rgba(255,71,87,.4);border-radius:7px;margin-bottom:12px">
+        <div style="color:#ff4757;font-weight:700;font-size:12px;margin-bottom:6px">⛔ 403 Forbidden — Root Cause Analysis</div>
+        <ul style="margin:0;padding-left:18px;color:#c0c4d6;font-size:12px;line-height:1.8">
+          <li>Check <strong>Request Headers</strong> below — is an Authorization or Cookie header present?</li>
+          <li>restful-booker PUT/DELETE needs <code style="background:#1a1d27;padding:1px 5px;border-radius:3px;color:#a29bfe">Cookie: token=xxx</code>, not <code style="background:#1a1d27;padding:1px 5px;border-radius:3px;color:#a29bfe">Bearer</code></li>
+          <li>Fix: in Auth &amp; Data → Custom Headers add <code style="background:#1a1d27;padding:1px 5px;border-radius:3px;color:#a29bfe">Cookie</code> = <code style="background:#1a1d27;padding:1px 5px;border-radius:3px;color:#a29bfe">token={{auth_token}}</code></li>
+          <li>Token may have expired — re-run to get a fresh token</li>
+        </ul>
+      </div>`;
+    } else if (sc === 401) {
+      hintHtml = `<div style="flex:0 0 100%;padding:10px 14px;background:#2b0d0d;border:1px solid rgba(255,71,87,.4);border-radius:7px;margin-bottom:12px">
+        <div style="color:#ff4757;font-weight:700;font-size:12px;margin-bottom:4px">🔒 401 Unauthorized — token missing or invalid</div>
+        <div style="color:#c0c4d6;font-size:12px">Check the Authorization header in Request Headers below. If empty, auth step may have failed or token variable not injected.</div>
+      </div>`;
+    } else if (sc === 404) {
+      hintHtml = `<div style="flex:0 0 100%;padding:10px 14px;background:#1e1a0d;border:1px solid rgba(255,165,0,.4);border-radius:7px;margin-bottom:12px">
+        <div style="color:#ffa502;font-weight:700;font-size:12px;margin-bottom:4px">⚠️ 404 Not Found — resource ID may be wrong</div>
+        <div style="color:#c0c4d6;font-size:12px">Check the URL above — the ID in the path should have been extracted from the POST response. Verify the id_field mapping in Configure Chain.</div>
+      </div>`;
+    }
 
     return `
     <tr style="background:${rowBg}">
@@ -1329,33 +2105,51 @@ function buildReportHtml(result) {
       <td style="padding:10px 14px"><span style="background:#2a2a3a;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:800;color:#a29bfe">${h(step.method)}</span></td>
       <td style="padding:10px 14px;font-family:monospace;font-size:12px;word-break:break-all">${h(step.url)}</td>
       <td style="padding:10px 14px;text-align:center;font-weight:700;color:${scColor}">${sc || '—'}</td>
-      <td style="padding:10px 14px;text-align:right;color:#888;font-size:12px">${step.duration_ms ? step.duration_ms+'ms' : '—'}</td>
+      <td style="padding:10px 14px;text-align:right;color:#888;font-size:12px">${step.duration_ms ? step.duration_ms.toFixed(0)+'ms' : '—'}</td>
     </tr>
     <tr style="background:#141420">
       <td colspan="6" style="padding:0">
-        <div style="padding:14px 20px;display:flex;gap:24px;flex-wrap:wrap;font-size:12px">
+        <div style="padding:14px 20px;display:flex;gap:16px;flex-wrap:wrap;font-size:12px">
+          ${hintHtml}
           ${extracts.length ? `
-          <div style="flex:0 0 100%;margin-bottom:8px">
-            <div style="color:#6c63ff;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Extracted Variables</div>
+          <div style="flex:0 0 100%;margin-bottom:4px">
+            <div style="color:#6c63ff;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">⚙ Extracted Variables</div>
             <div style="display:flex;flex-wrap:wrap;gap:6px">
               ${extracts.map(([k,v]) => `<span style="background:rgba(108,99,255,.15);border:1px solid rgba(108,99,255,.3);padding:3px 10px;border-radius:4px;font-family:monospace;color:#a29bfe">{{${h(k)}}} = ${h(String(v))}</span>`).join('')}
             </div>
           </div>` : ''}
+
+          <div style="flex:0 0 100%;margin-bottom:4px">
+            <div style="color:#8b8fa8;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">🔑 Request Headers (${Object.keys(hdrs).length} sent)</div>
+            <table style="width:100%;border-collapse:collapse;background:#0f1117;border:1px solid #2e3147;border-radius:6px;overflow:hidden;margin:0">
+              <thead><tr>
+                <th style="padding:5px 10px;text-align:left;font-size:10px;color:#555;font-weight:700;text-transform:uppercase;letter-spacing:.6px;background:#1a1d27;border-bottom:1px solid #2e3147;width:35%">Header</th>
+                <th style="padding:5px 10px;text-align:left;font-size:10px;color:#555;font-weight:700;text-transform:uppercase;letter-spacing:.6px;background:#1a1d27;border-bottom:1px solid #2e3147">Value</th>
+              </tr></thead>
+              <tbody>${hdrRowsHtml}</tbody>
+            </table>
+          </div>
+
           ${reqBody ? `
           <div style="flex:1;min-width:280px">
-            <div style="color:#8b8fa8;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Request Body</div>
+            <div style="color:#8b8fa8;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">📤 Request Body</div>
             <pre style="background:#0f1117;border:1px solid #2e3147;border-radius:6px;padding:10px;margin:0;font-size:11px;color:#e4e6f1;overflow-x:auto;white-space:pre-wrap;word-break:break-all;max-height:220px;overflow-y:auto">${h(reqBody)}</pre>
           </div>` : ''}
           ${respBody ? `
           <div style="flex:1;min-width:280px">
-            <div style="color:#8b8fa8;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Response Body</div>
+            <div style="color:#8b8fa8;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">📥 Response Body</div>
             <pre style="background:#0f1117;border:1px solid #2e3147;border-radius:6px;padding:10px;margin:0;font-size:11px;color:#e4e6f1;overflow-x:auto;white-space:pre-wrap;word-break:break-all;max-height:220px;overflow-y:auto">${h(respBody)}</pre>
           </div>` : ''}
           ${step.error ? `
           <div style="flex:0 0 100%">
-            <div style="color:#ff4757;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Error</div>
+            <div style="color:#ff4757;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">💥 Error</div>
             <pre style="background:#2b0d0d;border:1px solid rgba(255,71,87,.3);border-radius:6px;padding:10px;margin:0;font-size:12px;color:#ff4757">${h(step.error)}</pre>
           </div>` : ''}
+
+          <div style="flex:0 0 100%;margin-top:4px">
+            <div style="color:#8b8fa8;font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">📋 cURL Command</div>
+            <pre style="background:#0f1117;border:1px solid #2e3147;border-radius:6px;padding:10px;margin:0;font-size:11px;color:#e4e6f1;white-space:pre-wrap;word-break:break-all">${curlCmd}</pre>
+          </div>
         </div>
       </td>
     </tr>`;
