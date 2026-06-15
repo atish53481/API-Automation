@@ -95,8 +95,6 @@ function _autoBootstrapFromSpec() {
     state.idFields[id]          = '';   // resolved later by _detectChainKey in renderApiPanel
     state.postFields[id]        = [];
     state.selectedResources[id] = resource;
-    // Delete OFF by default — must be explicitly enabled per API
-    state.apiOps[id]            = { create:true, read:true, update:true, delete:false };
     state.apiHeaders[id]        = [];
     state.apiAuth[id]           = null;
     state.responseSchemas[id]   = null;
@@ -114,6 +112,14 @@ function _autoBootstrapFromSpec() {
     if (getEp)    state.selections[id].get    = getEp.path;
     if (putEp)    state.selections[id].put    = putEp.path;
     if (deleteEp) state.selections[id].delete = deleteEp.path;
+
+    // Ops derived from what the spec actually has — only enable what exists
+    state.apiOps[id] = {
+      create: !!postEp,
+      read:   !!getEp,
+      update: !!putEp,
+      delete: false,   // always opt-in: last operation in a cascade should be intentional
+    };
 
     // Use response schema from spec when available
     if (postEp?.response_schema) {
@@ -155,14 +161,17 @@ function _autoBootstrapFromSpec() {
   // Auto-wire bearer token from first detected auth resource
   const authResource = resources.find(r => _AUTH_RESOURCES.has(r.toLowerCase()));
   if (authResource) {
-    // Derive the token var: e.g. auth resource "auth" → {{auth_token}}
     const authId       = _sanitizeId(authResource);
     const tokenField   = (state.responseSchemas[authId]?.properties
                           ? Object.keys(state.responseSchemas[authId].properties)[0]
                           : 'token');
-    state._autoAuth = `{{${authId}_${tokenField}}}`;
+    state._autoAuth       = `{{${authId}_${tokenField}}}`;
+    state._authTokenVar   = `${authId}_${tokenField}`;   // e.g. "auth_token"
+    state._authApiId      = authId;
   } else {
-    state._autoAuth = null;
+    state._autoAuth     = null;
+    state._authTokenVar = null;
+    state._authApiId    = null;
   }
 }
 
@@ -866,6 +875,14 @@ function autoAssignFromResource(resource, apiId) {
     apiId = _renameApiId(apiId, _sanitizeId(resource));
   }
 
+  // Sync ops to reflect which endpoints are actually assigned (no forcing CRUD on partial specs)
+  state.apiOps[apiId] = {
+    create: !!postEp,
+    read:   !!getEp,
+    update: !!putEp,
+    delete: state.apiOps[apiId]?.delete || false,
+  };
+
   // Response schema: spec → auth heuristic → body-fallback (wraps body under resource key)
   const rLow = resource.toLowerCase();
   if (postEp?.response_schema) {
@@ -1049,25 +1066,24 @@ function renderApiPanel(api) {
       <div style="margin-top:4px">
         <label style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;display:block;margin-bottom:8px">Operations to Execute</label>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
-          ${['create','read','update','delete'].map(op => {
+          ${(() => {
             const icons  = {create:'🟣 CREATE',read:'🟢 READ',update:'🟡 UPDATE',delete:'🔴 DELETE'};
-            const epKey  = {create:'post',read:'get',update:'put',delete:'delete'}[op];
-            const hasEp  = !!state.selections[api.id]?.[epKey];
-            const checked = hasEp && (state.apiOps[api.id]?.[op] !== false) ? 'checked' : '';
-            return `<label style="display:flex;align-items:center;gap:6px;
-              cursor:${hasEp?'pointer':'not-allowed'};
-              background:var(--surface2);
-              border:1px solid ${hasEp?'var(--border)':'transparent'};
-              padding:6px 12px;border-radius:7px;font-size:12px;font-weight:600;
-              user-select:none;${hasEp?'':'opacity:.35'}">
-              <input type="checkbox" id="op-${api.id}-${op}"
-                ${checked} ${hasEp?'':'disabled'}
-                onchange="toggleOp('${api.id}','${op}',this.checked)"
-                style="width:14px;height:14px"/>
-              ${icons[op]}
-              ${!hasEp?'<span style="font-size:9px;margin-left:2px">(no endpoint)</span>':''}
-            </label>`;
-          }).join('')}
+            const epKeys = {create:'post',read:'get',update:'put',delete:'delete'};
+            const chips  = ['create','read','update','delete'].map(op => {
+              const hasEp = !!state.selections[api.id]?.[epKeys[op]];
+              if (!hasEp) return '';   // spec has no endpoint for this op — skip entirely
+              const checked = (state.apiOps[api.id]?.[op] !== false) ? 'checked' : '';
+              return `<label style="display:flex;align-items:center;gap:6px;cursor:pointer;
+                background:var(--surface2);border:1px solid var(--border);
+                padding:6px 12px;border-radius:7px;font-size:12px;font-weight:600;user-select:none">
+                <input type="checkbox" id="op-${api.id}-${op}" ${checked}
+                  onchange="toggleOp('${api.id}','${op}',this.checked)"
+                  style="width:14px;height:14px"/>
+                ${icons[op]}
+              </label>`;
+            }).join('');
+            return chips || '<span class="hint">No endpoints configured — select a resource above.</span>';
+          })()}
         </div>
       </div>
 
@@ -1448,6 +1464,7 @@ function renderDataPage() {
         </div>
         <div id="headers-${a.id}"></div>
       </div>
+      ${_renderApiAuthSection(a.id)}
     </div>` : `
     <div class="card" style="border-left:3px solid ${color}">
       <!-- Custom headers (no PUT endpoint) -->
@@ -1459,6 +1476,7 @@ function renderDataPage() {
         </div>
         <div id="headers-${a.id}"></div>
       </div>
+      ${_renderApiAuthSection(a.id)}
     </div>`}
     `;
   }).join('');
@@ -1493,6 +1511,7 @@ function renderDataPage() {
         window._wireVarAC(document.getElementById(`put-field-val-${a.id}-${i}`));
       });
     }
+    renderApiAuthFields(a.id);
   });
   window._wireVarAC && window._wireVarAC(document.getElementById('auth-token'));
 }
@@ -1520,6 +1539,105 @@ function renderHeaders(apiId) {
         oninput="state.apiHeaders['${apiId}'][${i}].value=this.value"/>
       <button class="btn btn-danger btn-sm" style="padding:3px 8px" onclick="removeHeader('${apiId}',${i})">✕</button>
     </div>`).join('');
+}
+
+// ── Quick Fix: inject Cookie auth header for APIs that need cookie-based auth ──
+function quickFixCookieAuth(apiId) {
+  const tokenVar = state._authTokenVar;
+  if (!tokenVar) {
+    alert('No auth token variable detected. Run the chain once so the auth API response is captured, then try again.');
+    return;
+  }
+  const hdrs = state.apiHeaders[apiId] || (state.apiHeaders[apiId] = []);
+  // Remove existing Cookie entry if present (avoid duplicates)
+  const idx = hdrs.findIndex(h => h.key.toLowerCase() === 'cookie');
+  const cookieVal = `token={{${tokenVar}}}`;
+  if (idx >= 0) {
+    hdrs[idx].value = cookieVal;
+  } else {
+    hdrs.push({ key: 'Cookie', value: cookieVal });
+  }
+  // Re-render headers if the Auth & Data page is currently visible
+  renderHeaders(apiId);
+  alert(`✅ Cookie header added:\n  Cookie: ${cookieVal}\n\nThis {{var}} will be replaced with the live token at run-time.\nNow click "▶ Run Chain" again.`);
+}
+
+// ── Per-API Auth Override ─────────────────────────────────────────────────────
+function updateApiAuth(apiId, field, val) {
+  if (!state.apiAuth[apiId]) state.apiAuth[apiId] = { type: 'none' };
+  state.apiAuth[apiId][field] = val;
+  if (field === 'type') renderApiAuthFields(apiId);
+}
+
+function renderApiAuthFields(apiId) {
+  const c = document.getElementById(`api-auth-fields-${apiId}`);
+  if (!c) return;
+  const auth = state.apiAuth[apiId];
+  const type = auth?.type || 'none';
+  if (type === 'none') { c.innerHTML = ''; return; }
+  if (type === 'bearer') {
+    c.innerHTML = `<div class="form-group" style="margin-top:8px">
+      <label>Bearer Token</label>
+      <input type="text" value="${escHtml(auth.token||'')}" placeholder="token or {{var}}"
+        oninput="updateApiAuth('${apiId}','token',this.value)"/>
+    </div>`;
+  } else if (type === 'basic') {
+    c.innerHTML = `<div style="display:flex;gap:8px;margin-top:8px">
+      <div class="form-group" style="flex:1"><label>Username</label>
+        <input type="text" value="${escHtml(auth.username||'')}"
+          oninput="updateApiAuth('${apiId}','username',this.value)"/>
+      </div>
+      <div class="form-group" style="flex:1"><label>Password</label>
+        <input type="password" value="${escHtml(auth.password||'')}"
+          oninput="updateApiAuth('${apiId}','password',this.value)"/>
+      </div>
+    </div>`;
+  } else if (type === 'api_key') {
+    c.innerHTML = `<div style="display:flex;gap:8px;margin-top:8px">
+      <div class="form-group" style="flex:1"><label>Key Name</label>
+        <input type="text" value="${escHtml(auth.key_name||'')}" placeholder="X-API-Key"
+          oninput="updateApiAuth('${apiId}','key_name',this.value)"/>
+      </div>
+      <div class="form-group" style="flex:1"><label>Key Value</label>
+        <input type="text" value="${escHtml(auth.key_value||'')}"
+          oninput="updateApiAuth('${apiId}','key_value',this.value)"/>
+      </div>
+      <div class="form-group" style="flex:1"><label>Send In</label>
+        <select onchange="updateApiAuth('${apiId}','key_in',this.value)">
+          <option value="header" ${(auth.key_in||'header')==='header'?'selected':''}>Header</option>
+          <option value="query" ${auth.key_in==='query'?'selected':''}>Query Param</option>
+        </select>
+      </div>
+    </div>`;
+  }
+}
+
+function _renderApiAuthSection(apiId) {
+  const auth = state.apiAuth[apiId];
+  const type = auth?.type || 'none';
+  const badge = type === 'none'
+    ? '<span style="font-weight:400;color:var(--text-dim)">Inherit Global</span>'
+    : `<span style="font-weight:400;color:var(--accent)">${type}</span>`;
+  return `
+  <details style="margin-top:14px">
+    <summary style="cursor:pointer;font-size:11px;font-weight:700;color:var(--text-dim);
+      text-transform:uppercase;letter-spacing:.6px;list-style:none;
+      display:flex;align-items:center;gap:6px;user-select:none">
+      🔑 Auth Override &nbsp;${badge}
+    </summary>
+    <div style="margin-top:8px;padding:10px;background:rgba(108,99,255,.05);border-radius:6px;border:1px solid rgba(108,99,255,.15)">
+      <p class="hint" style="margin-bottom:8px">
+        Override global auth for <strong>this API only</strong>. Leave as <em>Inherit Global</em> to use the auth set above.
+      </p>
+      <select onchange="updateApiAuth('${apiId}','type',this.value)">
+        <option value="none" ${type==='none'?'selected':''}>Inherit Global</option>
+        <option value="bearer" ${type==='bearer'?'selected':''}>Bearer Token</option>
+        <option value="basic" ${type==='basic'?'selected':''}>Basic Auth</option>
+        <option value="api_key" ${type==='api_key'?'selected':''}>API Key</option>
+      </select>
+      <div id="api-auth-fields-${apiId}"></div>
+    </div>
+  </details>`;
 }
 
 function renderFieldEditor(apiId) {
@@ -1711,6 +1829,18 @@ function buildChainConfig() {
     // ops
     const ops = state.apiOps[a.id] || { create:true, read:true, update:true, delete:true };
 
+    // per-API auth override (null → inherit global)
+    const _pa = state.apiAuth[a.id];
+    const perApiAuth = (_pa && _pa.type && _pa.type !== 'none') ? {
+      type:      _pa.type,
+      token:     _pa.token     || null,
+      username:  _pa.username  || null,
+      password:  _pa.password  || null,
+      key_name:  _pa.key_name  || null,
+      key_value: _pa.key_value || null,
+      key_in:    _pa.key_in    || 'header',
+    } : null;
+
     return {
       id: a.id,
       name: a.name,
@@ -1724,6 +1854,7 @@ function buildChainConfig() {
       id_field: state.idFields[a.id] || 'id',
       response_extracts: extracts,
       custom_headers: customHeaders,
+      auth: perApiAuth,
       ops,
     };
   });
@@ -1784,6 +1915,149 @@ function _buildDefaultSteps() {
   return steps;
 }
 
+function _renderWorkflowPreview(steps) {
+  if (!steps.length) return `
+  <div class="card" style="margin-bottom:16px;border-left:3px solid var(--accent)">
+    <div class="card-title"><span class="dot" style="background:var(--accent)"></span>Execution Workflow Preview</div>
+    <p class="hint">No steps yet — go to <strong>Configure Chain</strong>, select endpoints, then return here.</p>
+  </div>`;
+
+  const epKeyOf = { create:'post', read:'get', update:'put', delete:'delete' };
+  const phaseLabel = { create:'CREATE', read:'READ', update:'UPDATE', delete:'DELETE' };
+  const phaseNote  = {
+    create: 'POST — creates resource, captures ID/token for next steps',
+    read:   'GET — reads/verifies the resource',
+    update: 'PUT — modifies the resource',
+    delete: 'DELETE — removes the resource',
+  };
+
+  const enabledCount = steps.filter(s => s.enabled).length;
+  const skippedCount = steps.length - enabledCount;
+  let seqNum = 0;  // counts only enabled steps for the visible number
+  let prevPhase = null;
+
+  let stepsHtml = '';
+  steps.forEach((step, i) => {
+    const api  = state.apis.find(a => a.id === step.apiId);
+    if (!api) return;
+    const meta    = _opMeta[step.operation];
+    const epKey   = epKeyOf[step.operation];
+    const ep      = state.selections[step.apiId]?.[epKey] || '';
+    const apiColor = _apiColor(api.colorIdx);
+    const skipped  = !step.enabled;
+    if (!skipped) seqNum++;
+
+    // Phase-change divider
+    if (step.operation !== prevPhase) {
+      if (prevPhase !== null) {
+        // Connector between phases
+        stepsHtml += `
+        <div style="display:flex;align-items:center;gap:10px;padding:4px 0 4px 34px">
+          <div style="width:2px;height:20px;background:linear-gradient(to bottom,${_opMeta[prevPhase].color}66,${meta.color}66);border-radius:2px;margin-left:11px"></div>
+          <span style="font-size:10px;color:var(--text-dim);font-style:italic">extracted variables flow to next phase →</span>
+        </div>`;
+      }
+      stepsHtml += `
+      <div style="display:flex;align-items:center;gap:8px;margin:6px 0 6px 0">
+        <div style="height:1px;flex:0 0 8px;background:${meta.color}66"></div>
+        <span style="font-size:9px;font-weight:800;letter-spacing:1.2px;color:${meta.color};
+          text-transform:uppercase;white-space:nowrap;padding:2px 8px;border-radius:3px;
+          background:${meta.color}18;border:1px solid ${meta.color}44">
+          ${phaseLabel[step.operation]}
+        </span>
+        <div style="height:1px;flex:1;background:${meta.color}33"></div>
+        <span style="font-size:10px;color:var(--text-dim);white-space:nowrap;padding-right:4px">${phaseNote[step.operation]}</span>
+      </div>`;
+      prevPhase = step.operation;
+    }
+
+    // Connector arrow between consecutive steps of same phase
+    if (i > 0 && steps[i-1]?.operation === step.operation) {
+      stepsHtml += `
+      <div style="padding-left:45px;color:var(--text-dim);font-size:11px;line-height:1;margin:-2px 0">↓</div>`;
+    }
+
+    // Captured variables hint (POST steps that have a response schema)
+    const schema = state.responseSchemas[step.apiId];
+    let capturesHtml = '';
+    if (!skipped && step.operation === 'create' && schema?.properties) {
+      const vars = Object.keys(schema.properties);
+      const shown = vars.slice(0, 4).map(k =>
+        `<code style="color:var(--accent);background:rgba(108,99,255,.08);
+          padding:1px 5px;border-radius:3px;font-size:10px">{{${step.apiId}_${k}}}</code>`
+      ).join(' ');
+      const extra = vars.length > 4 ? `<span style="font-size:10px;color:var(--text-dim)"> +${vars.length-4} more</span>` : '';
+      capturesHtml = `
+      <div style="margin-top:5px;font-size:10px;color:var(--text-dim);display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+        <span>↳ captures:</span>${shown}${extra}
+      </div>`;
+    }
+
+    // The ID field injected into GET/PUT/DELETE paths
+    let injectsHtml = '';
+    if (!skipped && ep.includes('{') && step.operation !== 'create') {
+      const idVar = `{{${step.apiId}_id}}`;
+      injectsHtml = `
+      <div style="margin-top:4px;font-size:10px;color:var(--text-dim)">
+        ↳ uses: <code style="color:#ffa502;background:rgba(255,165,2,.08);padding:1px 5px;border-radius:3px;font-size:10px">${idVar}</code>
+        to resolve path param
+      </div>`;
+    }
+
+    stepsHtml += `
+    <div style="display:flex;align-items:flex-start;gap:10px;padding:9px 12px;
+      border-radius:8px;transition:all .15s;
+      background:${skipped ? 'transparent' : 'var(--surface2)'};
+      border:1px solid ${skipped ? 'rgba(255,255,255,.04)' : 'var(--border)'};
+      ${skipped ? 'opacity:.38' : ''}">
+      <!-- Step number circle -->
+      <div style="flex-shrink:0;width:26px;height:26px;border-radius:50%;margin-top:1px;
+        display:flex;align-items:center;justify-content:center;
+        font-size:11px;font-weight:800;
+        background:${skipped ? 'var(--surface2)' : meta.color + '20'};
+        border:2px solid ${skipped ? 'var(--border)' : meta.color};
+        color:${skipped ? 'var(--text-dim)' : meta.color}">
+        ${skipped ? '–' : seqNum}
+      </div>
+      <!-- Content -->
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${skipped
+            ? `<span style="font-size:10px;color:var(--text-dim);padding:2px 8px;border-radius:4px;
+                background:var(--surface2);border:1px solid var(--border);font-weight:700">⊘ SKIPPED</span>`
+            : `<span style="font-size:10px;font-weight:800;padding:3px 10px;border-radius:4px;
+                background:${meta.color}22;color:${meta.color};border:1px solid ${meta.color}55;
+                letter-spacing:.3px">${meta.method}</span>`}
+          <span style="font-weight:700;font-size:13px;color:${skipped ? 'var(--text-dim)' : apiColor}">${escHtml(api.name)}</span>
+          <code style="font-size:11px;color:var(--text-dim);background:var(--bg);
+            padding:2px 7px;border-radius:4px;border:1px solid var(--border);
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px">${escHtml(ep) || '<em>no endpoint</em>'}</code>
+        </div>
+        ${capturesHtml}
+        ${injectsHtml}
+      </div>
+    </div>`;
+  });
+
+  return `
+  <div class="card" style="margin-bottom:16px;border-left:3px solid var(--accent)">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+      <div>
+        <div class="card-title" style="margin:0">
+          <span class="dot" style="background:var(--accent)"></span>Execution Workflow Preview
+        </div>
+        <p class="hint" style="margin:4px 0 0">
+          <strong style="color:var(--text)">${enabledCount}</strong> step${enabledCount!==1?'s':''} will run in this exact order
+          ${skippedCount ? `· <span style="color:var(--warning)">${skippedCount} step${skippedCount!==1?'s':''} skipped (unchecked below)</span>` : '· all steps active'}
+        </p>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:3px">
+      ${stepsHtml}
+    </div>
+  </div>`;
+}
+
 function renderRunPage() {
   if (!state.executionSteps.length)
     state.executionSteps = _buildDefaultSteps();
@@ -1820,13 +2094,16 @@ function renderRunPage() {
     </div>`;
   }).join('');
 
+  const workflowHtml = _renderWorkflowPreview(state.executionSteps);
+
   const seqHtml = `
+  ${workflowHtml}
   <div class="card" style="margin-bottom:16px">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-      <div class="card-title" style="margin:0"><span class="dot"></span>Execution Steps</div>
+      <div class="card-title" style="margin:0"><span class="dot"></span>Execution Steps <span style="font-size:10px;font-weight:400;color:var(--text-dim)">(reorder / skip)</span></div>
       <button class="btn btn-secondary btn-sm" onclick="resetExecSteps()">↺ Reset to Default</button>
     </div>
-    <p class="hint" style="margin-bottom:12px">Reorder with ▲▼ or uncheck to skip individual steps. Reflects your API config — hit Reset if you changed endpoints.</p>
+    <p class="hint" style="margin-bottom:12px">Reorder with ▲▼ or uncheck to skip. Hit Reset if you changed endpoints.</p>
     <div style="display:flex;flex-direction:column;gap:6px">
       ${rows || '<p class="hint">No steps yet. Go to Configure Chain and select endpoints, then come back.</p>'}
     </div>
@@ -1837,7 +2114,10 @@ function renderRunPage() {
 }
 
 function toggleExecStep(idx, enabled) {
-  if (state.executionSteps[idx]) state.executionSteps[idx].enabled = enabled;
+  if (state.executionSteps[idx]) {
+    state.executionSteps[idx].enabled = enabled;
+    renderRunPage();
+  }
 }
 
 function moveExecStep(idx, dir) {
@@ -1885,10 +2165,6 @@ function renderResults(result) {
 
   const container = document.getElementById('results-container');
   container.innerHTML = result.steps.map((step, i) => renderStep(step, i)).join('');
-
-  container.querySelectorAll('.step-header').forEach(h => {
-    h.addEventListener('click', () => h.nextElementSibling.classList.toggle('open'));
-  });
 }
 
 function renderStep(step, i) {
@@ -1896,98 +2172,175 @@ function renderStep(step, i) {
   const statusColor = step.success ? 'var(--success)' : 'var(--error)';
   const codeClass = !step.status_code ? '' :
     step.status_code < 300 ? 'code-2xx' : step.status_code < 500 ? 'code-4xx' : 'code-5xx';
-
-  const extractedHtml = Object.keys(step.extracted || {}).length > 0
-    ? `<div class="extracted-vars">
-        ${Object.entries(step.extracted).map(([k,v]) =>
-          `<span class="var-chip">{{${k}}} = ${v}</span>`
-        ).join('')}
-       </div>` : '';
-
-  // ── Request headers ──────────────────────────────────────────────────────────
+  const uid = `step-${i}`;
   const hdrs = step.request_headers || {};
-  const hdrRows = Object.keys(hdrs).length
-    ? Object.entries(hdrs).map(([k, v]) => {
-        const isAuth = k.toLowerCase().includes('auth') || k.toLowerCase().includes('cookie') || k.toLowerCase() === 'token';
-        return `<div style="font-size:11px;font-family:var(--mono);padding:2px 0;border-bottom:1px solid rgba(46,49,71,.3)">
-          <span style="${isAuth ? 'color:var(--accent);font-weight:700' : 'color:var(--text-dim)'}">${escHtml(k)}</span>:
-          <span style="color:var(--text)">${escHtml(String(v))}</span>
-        </div>`;
-      }).join('')
-    : `<div style="font-size:11px;color:var(--text-dim);font-style:italic">No headers captured</div>`;
 
-  // ── cURL equivalent ──────────────────────────────────────────────────────────
-  const curlHdrs = Object.entries(hdrs).map(([k,v]) => `  -H '${escHtml(k)}: ${escHtml(String(v))}'`).join(' \\\n');
-  const curlBody = step.request_body
-    ? ` \\\n  -d '${escHtml(JSON.stringify(step.request_body))}'`
-    : '';
-  const curlCmd = `curl -X ${step.method} '${escHtml(step.url)}'${curlHdrs ? ' \\\n' + curlHdrs : ''}${curlBody}`;
+  // ── cURL ─────────────────────────────────────────────────────────────────────
+  const curlHdrs = Object.entries(hdrs).map(([k,v]) => `-H '${k}: ${String(v)}'`).join(' \\\n     ');
+  const curlBody = step.request_body ? ` \\\n     -d '${JSON.stringify(step.request_body)}'` : '';
+  const curlCmd  = `curl -X ${step.method} '${step.url}'${curlHdrs ? ' \\\n     ' + curlHdrs : ''}${curlBody}`;
 
-  // ── 4xx hint ─────────────────────────────────────────────────────────────────
+  // ── Root-cause hint ───────────────────────────────────────────────────────────
   let hintHtml = '';
   if (step.status_code === 403) {
-    hintHtml = `<div style="margin:8px 0;padding:10px 14px;background:rgba(255,71,87,.08);border:1px solid rgba(255,71,87,.35);border-radius:7px;font-size:12px">
-      <div style="font-weight:700;color:var(--error);margin-bottom:6px">⛔ 403 Forbidden — likely causes:</div>
-      <ul style="margin:0;padding-left:18px;color:var(--text-dim);line-height:1.7">
-        <li>Auth token not in request — check Request Headers below; Authorization must be present</li>
-        <li>Wrong token format — restful-booker PUT/DELETE needs <code style="color:var(--accent)">Cookie: token=xxx</code>, not Bearer</li>
-        <li>Token expired — run the chain again to get a fresh token</li>
-        <li>Endpoint requires different auth — add a custom header <code style="color:var(--accent)">Cookie: token={{auth_token}}</code> in Auth &amp; Data → Custom Headers</li>
+    const tokenVar = state._authTokenVar || 'auth_token';
+    const apiIdForFix = escHtml(step.api_id || '');
+    hintHtml = `
+    <div class="inspect-section" style="border-color:rgba(255,71,87,.4);background:rgba(255,71,87,.05)">
+      <div class="inspect-section-title" style="color:var(--error)">⛔ ROOT CAUSE — 403 Forbidden</div>
+      <ul style="margin:6px 0 0;padding-left:18px;color:var(--text-dim);line-height:1.8;font-size:12px">
+        <li>Auth token missing or wrong format — see <em>Request Headers</em> below</li>
+        <li>This API may need <code style="color:var(--accent)">Cookie: token=xxx</code> instead of Bearer (common in session-based APIs)</li>
+        <li>Token expired — re-run the chain to get a fresh token from the auth step</li>
       </ul>
+      ${apiIdForFix ? `
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,71,87,.2)">
+        <div style="font-size:11px;font-weight:700;color:var(--text-dim);margin-bottom:6px">🔧 ONE-CLICK FIX</div>
+        <p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">
+          Click below to auto-add <code style="color:var(--accent)">Cookie: token={{${tokenVar}}}</code>
+          as a custom header for this API. The <code style="color:var(--accent)">{{var}}</code> is
+          replaced with the live token at run-time.
+        </p>
+        <button class="btn btn-secondary btn-sm"
+          onclick="quickFixCookieAuth('${apiIdForFix}');showPage('data')">
+          🔧 Auto-add Cookie header → then go to Auth &amp; Data
+        </button>
+        <span style="font-size:11px;color:var(--text-dim);margin-left:10px">then re-run the chain</span>
+      </div>` : ''}
     </div>`;
   } else if (step.status_code === 401) {
-    hintHtml = `<div style="margin:8px 0;padding:10px 14px;background:rgba(255,71,87,.08);border:1px solid rgba(255,71,87,.35);border-radius:7px;font-size:12px">
-      <div style="font-weight:700;color:var(--error);margin-bottom:4px">🔒 401 Unauthorized — token missing or invalid</div>
-      <div style="color:var(--text-dim)">Check the Authorization header in Request Headers below.</div>
+    hintHtml = `
+    <div class="inspect-section" style="border-color:rgba(255,71,87,.4);background:rgba(255,71,87,.05)">
+      <div class="inspect-section-title" style="color:var(--error)">🔒 ROOT CAUSE — 401 Unauthorized</div>
+      <div style="color:var(--text-dim);font-size:12px;margin-top:4px">Token missing or invalid. Check <em>Authorization</em> in Request Headers below.</div>
+    </div>`;
+  } else if (step.status_code === 404) {
+    hintHtml = `
+    <div class="inspect-section" style="border-color:rgba(255,165,0,.4);background:rgba(255,165,0,.05)">
+      <div class="inspect-section-title" style="color:var(--warning)">🔍 ROOT CAUSE — 404 Not Found</div>
+      <div style="color:var(--text-dim);font-size:12px;margin-top:4px">Resource does not exist. The ID extracted from a previous step may be wrong, or the resource was already deleted.</div>
+    </div>`;
+  } else if (step.status_code >= 500) {
+    hintHtml = `
+    <div class="inspect-section" style="border-color:rgba(255,71,87,.4);background:rgba(255,71,87,.05)">
+      <div class="inspect-section-title" style="color:var(--error)">💥 ROOT CAUSE — ${step.status_code} Server Error</div>
+      <div style="color:var(--text-dim);font-size:12px;margin-top:4px">Server-side error. Check the request body format — a field may have the wrong type (e.g. sending a string where a number is expected).</div>
     </div>`;
   }
 
-  const reqBodyHtml = step.request_body
-    ? `<div style="margin-top:10px"><div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Request Body</div><pre style="margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap">${jsonStr(step.request_body)}</pre></div>` : '';
+  // ── Section builder helpers ───────────────────────────────────────────────────
+  const sectionTitle = (icon, text) =>
+    `<div class="inspect-section-title">${icon} ${text}</div>`;
 
-  const respBodyHtml = step.response_body !== null && step.response_body !== undefined
-    ? `<div style="margin-top:10px"><div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Response Body</div><pre style="margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap">${jsonStr(step.response_body)}</pre></div>` : '';
+  const pre = (content) =>
+    `<pre style="margin:6px 0 0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:11px;font-family:var(--mono);max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text)">${content}</pre>`;
 
-  const errorHtml = step.error
-    ? `<div style="margin-top:8px"><pre style="color:var(--error);font-size:12px;margin:0">${escHtml(step.error)}</pre></div>` : '';
+  // ── WHAT HAPPENED ─────────────────────────────────────────────────────────────
+  const statusLabel = step.status_code
+    ? `<span class="step-code ${codeClass}" style="font-size:13px;padding:3px 10px">${step.status_code}</span>`
+    : '';
+  const outcome = step.success
+    ? `<span style="color:var(--success);font-weight:700">✅ PASSED</span>`
+    : `<span style="color:var(--error);font-weight:700">❌ FAILED</span>`;
+  const whatHtml = `
+  <div class="inspect-section">
+    ${sectionTitle('📋', 'WHAT HAPPENED')}
+    <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+      ${outcome}
+      <span class="method-badge method-${step.method}" style="font-size:11px">${step.method}</span>
+      <code style="font-size:11px;color:var(--text)">${escHtml(step.url)}</code>
+      ${statusLabel}
+      <span style="color:var(--text-dim);font-size:11px">${step.duration_ms ? step.duration_ms.toFixed(0) + ' ms' : ''}</span>
+    </div>
+    ${step.error ? `<div style="margin-top:8px;padding:8px 12px;background:rgba(255,71,87,.08);border-radius:5px;font-family:var(--mono);font-size:11px;color:var(--error)">${escHtml(step.error)}</div>` : ''}
+  </div>`;
 
-  const uid = `step-${i}`;
-  const bodyHidden = step.success ? 'hidden' : '';
+  // ── REQUEST section ───────────────────────────────────────────────────────────
+  const hdrTableRows = Object.entries(hdrs).map(([k,v]) => {
+    const isAuth = /auth|cookie|token|x-api/i.test(k);
+    return `<tr>
+      <td style="padding:3px 10px 3px 0;font-weight:600;white-space:nowrap;${isAuth?'color:var(--accent)':'color:var(--text-dim)'}">${escHtml(k)}</td>
+      <td style="padding:3px 0;word-break:break-all;color:var(--text)">${escHtml(String(v))}</td>
+    </tr>`;
+  }).join('');
+  const hdrTable = Object.keys(hdrs).length
+    ? `<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:var(--mono)">${hdrTableRows}</table>`
+    : `<span style="color:var(--text-dim);font-style:italic;font-size:11px">No headers captured</span>`;
+
+  const reqHtml = `
+  <div class="inspect-section">
+    ${sectionTitle('📤', 'REQUEST')}
+    <div style="margin-top:8px">
+      <div style="font-size:10px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Headers (${Object.keys(hdrs).length})</div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px">${hdrTable}</div>
+    </div>
+    ${step.request_body ? `<div style="margin-top:10px">
+      <div style="font-size:10px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Body</div>
+      ${pre(jsonStr(step.request_body))}
+    </div>` : `<div style="margin-top:6px;font-size:11px;color:var(--text-dim);font-style:italic">No request body</div>`}
+  </div>`;
+
+  // ── RESPONSE section ──────────────────────────────────────────────────────────
+  const hasResp = step.response_body !== null && step.response_body !== undefined;
+  const respHtml = `
+  <div class="inspect-section">
+    ${sectionTitle('📥', 'RESPONSE')}
+    <div style="margin-top:8px;display:flex;align-items:center;gap:8px">
+      ${statusLabel || '<span style="color:var(--text-dim);font-size:11px">No status</span>'}
+      <span style="font-size:11px;color:${step.success?'var(--success)':'var(--error)'}">${step.success?'OK':'Error'}</span>
+    </div>
+    ${hasResp ? `<div style="margin-top:10px">
+      <div style="font-size:10px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Body</div>
+      ${pre(jsonStr(step.response_body))}
+    </div>` : `<div style="margin-top:6px;font-size:11px;color:var(--text-dim);font-style:italic">No response body</div>`}
+  </div>`;
+
+  // ── Extracted vars ────────────────────────────────────────────────────────────
+  const extEntries = Object.entries(step.extracted || {});
+  const extHtml = extEntries.length ? `
+  <div class="inspect-section">
+    ${sectionTitle('⛓', 'VARIABLES CAPTURED (available to next APIs)')}
+    <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">
+      ${extEntries.map(([k,v]) => `<span class="var-chip">{{${escHtml(k)}}} = ${escHtml(String(v))}</span>`).join('')}
+    </div>
+  </div>` : '';
+
+  // ── cURL section ──────────────────────────────────────────────────────────────
+  const curlHtml = `
+  <div class="inspect-section">
+    ${sectionTitle('📋', 'cURL — REPRODUCE THIS REQUEST')}
+    ${pre(escHtml(curlCmd))}
+    <button class="btn btn-secondary btn-sm" style="margin-top:8px"
+      onclick="navigator.clipboard.writeText(${JSON.stringify(curlCmd)}).then(()=>{this.textContent='✅ Copied!';setTimeout(()=>this.textContent='📋 Copy cURL',1500)})">
+      📋 Copy cURL
+    </button>
+  </div>`;
+
+  const bodyOpen = !step.success;
 
   return `
   <div class="step-result ${cls}">
-    <div class="step-header" onclick="document.getElementById('${uid}').classList.toggle('hidden')" style="cursor:pointer;user-select:none">
+    <div class="step-header" style="cursor:default">
       <span class="step-status" style="background:${statusColor}"></span>
       <span class="step-label">${escHtml(step.step)}</span>
       <span class="method-badge method-${step.method}">${step.method}</span>
       <span class="step-url">${escHtml(step.url)}</span>
       ${step.status_code ? `<span class="step-code ${codeClass}">${step.status_code}</span>` : ''}
       <span class="step-time">${step.duration_ms ? step.duration_ms.toFixed(0) + 'ms' : '—'}</span>
-      <span style="margin-left:auto;font-size:10px;color:var(--text-dim)">▼ inspect</span>
+      <button class="btn btn-secondary btn-sm" style="margin-left:auto;font-size:10px;padding:3px 10px;min-width:70px"
+        onclick="(function(btn){var b=document.getElementById('${uid}');var open=!b.classList.contains('hidden');b.classList.toggle('hidden',open);btn.textContent=open?'▼ Inspect':'▲ Close';})(this)">
+        ${bodyOpen ? '▲ Close' : '▼ Inspect'}
+      </button>
     </div>
-    <div id="${uid}" class="step-body ${bodyHidden}">
-      ${hintHtml}
-      ${extractedHtml ? `<div style="margin-bottom:8px"><div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Extracted Variables</div>${extractedHtml}</div>` : ''}
-
-      <details ${!step.success ? 'open' : ''} style="margin-top:4px">
-        <summary style="cursor:pointer;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;list-style:none">
-          🔑 Request Headers <span style="font-weight:400;color:var(--text-dim)">(${Object.keys(hdrs).length} sent)</span>
-        </summary>
-        <div style="margin-top:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px">
-          ${hdrRows}
-        </div>
-      </details>
-
-      ${reqBodyHtml}
-      ${respBodyHtml}
-      ${errorHtml}
-
-      <details style="margin-top:10px">
-        <summary style="cursor:pointer;font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;padding:4px 0;list-style:none">
-          📋 cURL command (copy to test manually)
-        </summary>
-        <pre style="margin-top:6px;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto">${curlCmd}</pre>
-      </details>
+    <div id="${uid}" class="step-body ${bodyOpen ? '' : 'hidden'}" style="padding:0">
+      <div style="padding:12px 16px;display:flex;flex-direction:column;gap:0">
+        ${whatHtml}
+        ${hintHtml}
+        ${reqHtml}
+        ${respHtml}
+        ${extHtml}
+        ${curlHtml}
+      </div>
     </div>
   </div>`;
 }

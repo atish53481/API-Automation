@@ -61,11 +61,15 @@ def _make_step(
     timeout: int,
     context: Dict[str, Any],
 ) -> StepResult:
+    resolved_headers = {
+        k: inject_context(str(v), context)
+        for k, v in (api.custom_headers or {}).items()
+    }
     result = execute_request(
         method=method,
         url=url,
         body=body,
-        headers=api.custom_headers or {},
+        headers=resolved_headers,
         auth=auth,
         verify_ssl=verify_ssl,
         timeout=timeout,

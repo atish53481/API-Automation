@@ -126,8 +126,7 @@ select option { background: var(--surface2); }
 .step-result.fail { border-left: 3px solid var(--error); }
 .step-result.skip { border-left: 3px solid var(--text-dim); }
 
-.step-header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; cursor: pointer; background: var(--surface2); transition: background .12s; }
-.step-header:hover { background: var(--surface); }
+.step-header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; cursor: default; background: var(--surface2); }
 .step-status { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .step-label { font-size: 13px; font-weight: 600; flex: 1; }
 .step-url   { font-family: var(--mono); font-size: 11px; color: var(--text-dim); flex: 2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -137,10 +136,11 @@ select option { background: var(--surface2); }
 .code-5xx { background: rgba(255,71,87,.15); color: var(--error); }
 .step-time  { font-size: 11px; color: var(--text-dim); min-width: 60px; text-align: right; }
 
-.step-body { display: none; padding: 14px 16px; background: var(--surface); }
-.step-body.open { display: block; }
-.step-body h4 { font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 6px; margin-top: 12px; }
-.step-body h4:first-child { margin-top: 0; }
+.step-body { display: block; background: var(--surface); border-top: 1px solid var(--border); }
+.step-body.hidden { display: none !important; }
+.inspect-section { padding: 14px 0; border-bottom: 1px solid var(--border); }
+.inspect-section:last-child { border-bottom: none; }
+.inspect-section-title { font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: .7px; }
 pre { background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; font-family: var(--mono); font-size: 11px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow-y: auto; color: var(--text); }
 
 /* ── extracted vars ── */
