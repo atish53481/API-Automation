@@ -288,7 +288,7 @@ function _prevApiVars(apiId) {
         Object.entries(props || {}).forEach(([field, prop]) => {
           const t  = prop.type || (prop.properties ? 'object' : 'string');
           const vn = `${prefix}_${field}`;
-          if (['string','integer','number','boolean'].includes(t)) {
+          if (['string','integer','number','boolean','date'].includes(t)) {
             vars.push({ asVar: vn, resourceName: rn, apiName: a.name, fieldLabel: field, apiId: a.id });
           } else if (t === 'object' && prop.properties) {
             collectVars(prop.properties, vn);
@@ -443,14 +443,23 @@ function _schemaToFields(schema, apiId, _prefix) {
       return;
     }
 
-    // 3. Example value (guard against object examples becoming "[object Object]")
+    // Detect date fields by name (camelCase-aware) OR by OpenAPI format hint
+    const isDateFld = type === 'date' || fmt === 'date' || fmt === 'date-time'
+                   || (type === 'string' && _isDateField(fullName));
+
+    // 3. Example value — still tag as date so dropdown works, but keep example as initial value
     if (prop.example != null && typeof prop.example !== 'object') {
-      fields.push({ name: fullName, type, value: String(prop.example), random: true });
+      fields.push({ name: fullName, type, value: String(prop.example), random: true,
+                    ...(isDateFld ? { dateFormat: 'YYYY-MM-DD' } : {}) });
       return;
     }
 
-    // 4. Auto-random
-    fields.push({ name: fullName, type, value: _randomValueForType(type, fmt), random: true });
+    // 4. Date fields → today's date in ISO (auto, no interaction needed); everything else → random
+    if (isDateFld) {
+      fields.push({ name: fullName, type, value: _applyDateFmt('YYYY-MM-DD'), random: false, dateFormat: 'YYYY-MM-DD' });
+    } else {
+      fields.push({ name: fullName, type, value: _randomValueForType(type, fmt), random: true });
+    }
   });
 
   return fields;
@@ -463,6 +472,7 @@ function _randomValueForType(type, fmt) {
   if (type === 'boolean') return String(Math.random() > 0.5);
   if (type === 'object')  return '{}';   // never produce a random string for objects
   if (type === 'array')   return '[]';   // never produce a random string for arrays
+  if (type === 'date')    return new Date().toISOString().slice(0,10);
   if (fmt === 'email')    return `user${Math.floor(Math.random()*9999)}@test.com`;
   if (fmt === 'uuid')     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random()*16|0; return (c==='x'?r:(r&0x3|0x8)).toString(16); });
@@ -472,10 +482,65 @@ function _randomValueForType(type, fmt) {
   return words[Math.floor(Math.random()*words.length)] + Math.floor(Math.random()*999);
 }
 
+// ── Date field helpers ────────────────────────────────────────────────────────
+function _pad2(n) { return String(n).padStart(2, '0'); }
+
+const _DATE_FIELD_RE = /(date|dob|birth|creat|updat|modif|start|end|expir|issu|due|sent|receiv|timestamp)/i;
+function _isDateField(name) {
+  // Split camelCase (bookingDate → booking Date) then also split on _ . -
+  const normalized = name.replace(/([A-Z])/g, ' $1').replace(/[_.\-]/g, ' ');
+  return _DATE_FIELD_RE.test(normalized);
+}
+
+const DATE_FORMATS = [
+  { key: 'YYYY-MM-DD',  label: 'YYYY-MM-DD         — 2024-01-30',          fn: d => `${d.getFullYear()}-${_pad2(d.getMonth()+1)}-${_pad2(d.getDate())}` },
+  { key: 'MM/DD/YYYY',  label: 'MM/DD/YYYY         — 01/30/2024',          fn: d => `${_pad2(d.getMonth()+1)}/${_pad2(d.getDate())}/${d.getFullYear()}` },
+  { key: 'DD/MM/YYYY',  label: 'DD/MM/YYYY         — 30/01/2024',          fn: d => `${_pad2(d.getDate())}/${_pad2(d.getMonth()+1)}/${d.getFullYear()}` },
+  { key: 'YYYY/MM/DD',  label: 'YYYY/MM/DD         — 2024/01/30',          fn: d => `${d.getFullYear()}/${_pad2(d.getMonth()+1)}/${_pad2(d.getDate())}` },
+  { key: 'MM-DD-YYYY',  label: 'MM-DD-YYYY         — 01-30-2024',          fn: d => `${_pad2(d.getMonth()+1)}-${_pad2(d.getDate())}-${d.getFullYear()}` },
+  { key: 'DD-MM-YYYY',  label: 'DD-MM-YYYY         — 30-01-2024',          fn: d => `${_pad2(d.getDate())}-${_pad2(d.getMonth()+1)}-${d.getFullYear()}` },
+  { key: 'MM.DD.YYYY',  label: 'MM.DD.YYYY         — 01.30.2024',          fn: d => `${_pad2(d.getMonth()+1)}.${_pad2(d.getDate())}.${d.getFullYear()}` },
+  { key: 'DD.MM.YYYY',  label: 'DD.MM.YYYY         — 30.01.2024',          fn: d => `${_pad2(d.getDate())}.${_pad2(d.getMonth()+1)}.${d.getFullYear()}` },
+  { key: 'MMDDYYYY',    label: 'MMDDYYYY           — 01302024',             fn: d => `${_pad2(d.getMonth()+1)}${_pad2(d.getDate())}${d.getFullYear()}` },
+  { key: 'DDMMYYYY',    label: 'DDMMYYYY           — 30012024',             fn: d => `${_pad2(d.getDate())}${_pad2(d.getMonth()+1)}${d.getFullYear()}` },
+  { key: 'YYYYMMDD',    label: 'YYYYMMDD           — 20240130',             fn: d => `${d.getFullYear()}${_pad2(d.getMonth()+1)}${_pad2(d.getDate())}` },
+  { key: 'MMDD',        label: 'MMDD               — 0130',                 fn: d => `${_pad2(d.getMonth()+1)}${_pad2(d.getDate())}` },
+  { key: 'DD Mon YYYY', label: 'DD Mon YYYY        — 30 Jan 2024',          fn: d => { const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return `${_pad2(d.getDate())} ${M[d.getMonth()]} ${d.getFullYear()}`; } },
+  { key: 'Mon DD YYYY', label: 'Mon DD, YYYY       — Jan 30, 2024',         fn: d => { const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return `${M[d.getMonth()]} ${_pad2(d.getDate())}, ${d.getFullYear()}`; } },
+  { key: 'ISO8601',     label: 'ISO 8601           — 2024-01-30T00:00:00Z', fn: d => d.toISOString() },
+  { key: 'RANDOM',      label: '🎲 Random Date     — picks random date ± 2 yrs', fn: null },
+];
+
+function _applyDateFmt(fmt, randomize) {
+  const entry = DATE_FORMATS.find(f => f.key === fmt);
+  let d = new Date();
+  if (randomize || fmt === 'RANDOM') {
+    d = new Date(d.getTime() + (Math.random() * 1460 - 730) * 86400000);
+  }
+  if (!entry || !entry.fn) return `${d.getFullYear()}-${_pad2(d.getMonth()+1)}-${_pad2(d.getDate())}`;
+  return entry.fn(d);
+}
+
+function onDateFormatChange(apiId, idx, fmt, isPut) {
+  const fields = isPut ? state.putFields[apiId] : state.postFields[apiId];
+  const f = fields?.[idx];
+  if (!f) return;
+  f.dateFormat = fmt;
+  f.value = _applyDateFmt(fmt, fmt === 'RANDOM');
+  const inputId = isPut ? `put-field-val-${apiId}-${idx}` : `field-val-${apiId}-${idx}`;
+  const inp = document.getElementById(inputId);
+  if (inp) inp.value = f.value;
+  updateJsonPreview(apiId);
+}
+
 function randomField(apiId, idx) {
   const f = state.postFields[apiId]?.[idx];
   if (!f) return;
-  f.value  = _randomValueForType(f.type);
+  if (f.dateFormat || f.type === 'date' || (f.type === 'string' && _isDateField(f.name))) {
+    f.value = _applyDateFmt(f.dateFormat || 'YYYY-MM-DD', true);
+  } else {
+    f.value = _randomValueForType(f.type);
+  }
   f.random = true;
   const inp = document.getElementById(`field-val-${apiId}-${idx}`);
   if (inp) inp.value = f.value;
@@ -508,11 +573,28 @@ function syncFieldValue(apiId, idx, val) {
 }
 
 function syncFieldName(apiId, idx, val) {
-  if (state.postFields[apiId]?.[idx]) state.postFields[apiId][idx].name = val;
+  const f = state.postFields[apiId]?.[idx];
+  if (!f) return;
+  f.name = val;
+  if (_isDateField(val) && f.type === 'string' && !f.value.startsWith('{{')) {
+    f.type = 'date';
+    f.value = _applyDateFmt('YYYY-MM-DD');
+    f.dateFormat = 'YYYY-MM-DD';
+    f.random = false;
+    renderFieldEditor(apiId);
+  }
 }
 
 function syncFieldType(apiId, idx, val) {
-  if (state.postFields[apiId]?.[idx]) state.postFields[apiId][idx].type = val;
+  const f = state.postFields[apiId]?.[idx];
+  if (!f) return;
+  f.type = val;
+  if (val === 'date') {
+    f.value = _applyDateFmt('YYYY-MM-DD');
+    f.dateFormat = 'YYYY-MM-DD';
+    f.random = false;
+    renderFieldEditor(apiId);
+  }
 }
 
 function _fieldsToBody(apiId) {
@@ -583,7 +665,7 @@ function renderPutFieldEditor(apiId) {
     container.innerHTML = `<div class="hint" style="margin-bottom:8px">No fields yet. Click <strong>+ Add Field</strong> or a resource with a PUT/PATCH schema.</div>`;
     return;
   }
-  const TYPES = ['string','integer','number','boolean','array','object'];
+  const TYPES = ['string','integer','number','boolean','array','object','date'];
   container.innerHTML = `
     <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:4px">
       <thead>
@@ -599,8 +681,9 @@ function renderPutFieldEditor(apiId) {
         ${fields.map((f, i) => {
           const isInject = f.value.startsWith('{{');
           const isArray  = f.type === 'array' || f.type === 'object';
+          const isDateF  = !isInject && !isArray && (f.type === 'date' || (f.type === 'string' && _isDateField(f.name)));
           const srcApi   = isInject ? _sourceApiForVar(f.value) : '';
-          const rowBg    = isInject ? 'background:rgba(108,99,255,.07)' : '';
+          const rowBg    = isInject ? 'background:rgba(108,99,255,.07)' : isDateF ? 'background:rgba(78,205,196,.04)' : '';
           const valStyle = isInject
             ? 'color:var(--accent);border-color:rgba(108,99,255,.5);font-weight:600'
             : isArray ? 'color:var(--warning);font-size:11px' : '';
@@ -611,13 +694,20 @@ function renderPutFieldEditor(apiId) {
             ? `<span style="font-size:9px;background:rgba(108,99,255,.25);color:#a29bfe;padding:1px 6px;border-radius:3px;white-space:nowrap">AUTO-INJECT</span>`
             : isArray
               ? `<span style="font-size:9px;background:rgba(255,165,0,.2);color:var(--warning);padding:1px 6px;border-radius:3px">ARRAY</span>`
-              : '';
+              : isDateF
+                ? `<span style="font-size:9px;background:rgba(78,205,196,.2);color:var(--accent2);padding:1px 6px;border-radius:3px">DATE</span>`
+                : '';
           const actionCell = (!isInject && !isArray)
-            ? `<button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:13px" title="Generate random"
+            ? `<button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:13px" title="${isDateF ? 'Random date in current format' : 'Generate random'}"
                 onclick="randomPutField('${apiId}',${i});document.getElementById('put-field-val-${apiId}-${i}').value=state.putFields['${apiId}'][${i}].value">🎲</button>`
             : (isInject
                 ? `<span title="Auto-injected from previous API" style="font-size:16px;cursor:default">⛓</span>`
                 : `<span style="color:var(--text-dim)">·</span>`);
+          const dateFmtSelect = isDateF ? `
+            <select style="width:100%;font-size:11px;padding:3px 5px;margin-bottom:3px;color:var(--accent2);border-color:rgba(78,205,196,.4)"
+              onchange="onDateFormatChange('${apiId}',${i},this.value,true)">
+              ${DATE_FORMATS.map(df => `<option value="${df.key}" ${(f.dateFormat||'YYYY-MM-DD')===df.key?'selected':''}>${df.label}</option>`).join('')}
+            </select>` : '';
           return `<tr style="border-bottom:1px solid rgba(46,49,71,.4);${rowBg}">
             <td style="padding:6px 8px;vertical-align:middle">
               <input style="font-family:var(--mono);font-size:12px" value="${escHtml(f.name)}"
@@ -637,14 +727,15 @@ function renderPutFieldEditor(apiId) {
               <div style="margin-top:3px">${typeBadge}</div>
             </td>
             <td style="padding:5px 6px;vertical-align:middle">
+              ${dateFmtSelect}
               <input id="put-field-val-${apiId}-${i}"
                 style="font-family:var(--mono);font-size:12px;${valStyle}"
                 value="${escHtml(f.value)}"
-                placeholder="${isInject ? '{{var}}' : isArray ? '[{"id":"{{var}}"}]' : 'enter value'}"
+                placeholder="${isInject ? '{{var}}' : isArray ? '[{"id":"{{var}}"}]' : isDateF ? 'YYYY-MM-DD' : 'enter value'}"
                 oninput="syncPutFieldValue('${apiId}',${i},this.value)"/>
             </td>
             <td style="padding:5px 4px;text-align:center;vertical-align:middle">
-              <button class="btn btn-danger btn-sm" style="padding:3px 7px" onclick="removePutField('${apiId}',${i})">✕</button>
+              ${actionCell}
             </td>
           </tr>`;
         }).join('')}
@@ -673,7 +764,11 @@ function onPutSourceChange(apiId, idx, val) {
 function randomPutField(apiId, idx) {
   const f = state.putFields[apiId]?.[idx];
   if (!f) return;
-  f.value  = _randomValueForType(f.type);
+  if (f.dateFormat || f.type === 'date' || (f.type === 'string' && _isDateField(f.name))) {
+    f.value = _applyDateFmt(f.dateFormat || 'YYYY-MM-DD', true);
+  } else {
+    f.value = _randomValueForType(f.type);
+  }
   f.random = true;
   const inp = document.getElementById(`put-field-val-${apiId}-${idx}`);
   if (inp) inp.value = f.value;
@@ -705,11 +800,28 @@ function syncPutFieldValue(apiId, idx, val) {
 }
 
 function syncPutFieldName(apiId, idx, val) {
-  if (state.putFields[apiId]?.[idx]) state.putFields[apiId][idx].name = val;
+  const f = state.putFields[apiId]?.[idx];
+  if (!f) return;
+  f.name = val;
+  if (_isDateField(val) && f.type === 'string' && !f.value.startsWith('{{')) {
+    f.type = 'date';
+    f.value = _applyDateFmt('YYYY-MM-DD');
+    f.dateFormat = 'YYYY-MM-DD';
+    f.random = false;
+    renderPutFieldEditor(apiId);
+  }
 }
 
 function syncPutFieldType(apiId, idx, val) {
-  if (state.putFields[apiId]?.[idx]) state.putFields[apiId][idx].type = val;
+  const f = state.putFields[apiId]?.[idx];
+  if (!f) return;
+  f.type = val;
+  if (val === 'date') {
+    f.value = _applyDateFmt('YYYY-MM-DD');
+    f.dateFormat = 'YYYY-MM-DD';
+    f.random = false;
+    renderPutFieldEditor(apiId);
+  }
 }
 
 // ── Navigation ────────────────────────────────────────────────────────────────
@@ -832,10 +944,19 @@ function _renameApiId(oldId, newId) {
 }
 
 function groupByResource(endpoints) {
-  // Group by first path segment: /products, /products/{id} → "products"
+  const SKIP = /^(api|rest|service|services|v\d+(\.\d+)?)$/i;
   const groups = {};
   for (const ep of endpoints) {
-    const seg = ep.path.split('/').filter(Boolean)[0] || 'root';
+    // OpenAPI tags are the authoritative resource name (e.g. "Activities", "Users")
+    let seg = (ep.tags && ep.tags.length > 0) ? ep.tags[0] : null;
+    if (!seg) {
+      // Fallback: skip version/api prefix segments, take first meaningful segment
+      const segs = ep.path.split('/').filter(Boolean);
+      seg = segs.find(s => !SKIP.test(s) && !s.includes('{'))
+            || segs.find(s => !s.includes('{'))
+            || segs[0]
+            || 'root';
+    }
     if (!groups[seg]) groups[seg] = [];
     groups[seg].push(ep);
   }
@@ -959,19 +1080,48 @@ function refreshResourceDropdowns() {
 }
 
 // ── PAGE 2: Configure Chain ───────────────────────────────────────────────────
+function applyGlobalBaseUrl(url) {
+  state.apis.forEach(a => {
+    state.baseUrls[a.id] = url;
+    const el = document.getElementById(`base-url-${a.id}`);
+    if (el) el.value = url;
+  });
+}
+
 function renderChainPage() {
+  // Prefer spec base_url, then any already-saved base URL in state
+  const specBase     = state.spec?.base_url || '';
+  const existingBase = specBase || Object.values(state.baseUrls).find(v => v) || '';
+
+  // Propagate into state before rendering panels so renderApiPanel picks it up
+  if (existingBase) applyGlobalBaseUrl(existingBase);
+
+  const sourceHint = specBase
+    ? `<span style="color:var(--success);font-size:11px">&#10003; Auto-detected from spec</span>`
+    : `<span style="color:var(--warning);font-size:11px">&#9888; Not found in spec — enter manually</span>`;
+
   const container = document.getElementById('api-panels-container');
   container.innerHTML =
+    `<div class="card" style="margin-bottom:16px">
+       <div class="card-title"><span class="dot"></span>Global Base URL &nbsp;${sourceHint}</div>
+       <div class="form-row cols-1" style="margin-bottom:8px">
+         <div class="form-group">
+           <label>Base URL <span style="font-weight:400;color:var(--text-dim)">(applied to all APIs — override per-panel if needed)</span></label>
+           <input type="text" id="global-base-url"
+             placeholder="https://api.example.com"
+             value="${existingBase}"
+             oninput="applyGlobalBaseUrl(this.value)"/>
+         </div>
+       </div>
+     </div>` +
     state.apis.map(a => renderApiPanel(a)).join('') +
     `<div style="margin-bottom:16px">
        <button class="btn btn-secondary" onclick="addApi()">＋ Add API</button>
        <span class="hint" style="margin-left:10px">Add API-3, API-4… Delete order is reverse of list</span>
      </div>`;
 
-  // restore saved values; fall back to spec base_url if not yet set
+  // DOM is now live — sync per-panel inputs and other fields
   state.apis.forEach(a => {
-    if (!state.baseUrls[a.id] && state.spec?.base_url)
-      state.baseUrls[a.id] = state.spec.base_url;
     const urlEl = document.getElementById(`base-url-${a.id}`);
     if (urlEl) urlEl.value = state.baseUrls[a.id] || '';
     const idEl = document.getElementById(`id-field-${a.id}`);
@@ -1346,7 +1496,7 @@ function _renderContextOutput(apiId) {
     Object.entries(props || {}).forEach(([field, prop]) => {
       const t  = prop.type || (prop.properties ? 'object' : 'string');
       const vn = `${prefix}_${field}`;
-      if (['string','integer','number','boolean'].includes(t)) {
+      if (['string','integer','number','boolean','date'].includes(t)) {
         if (!seenVars.has(vn)) { seenVars.add(vn); chips.push(mkChip(vn)); }
       } else if (t === 'object' && prop.properties) {
         collect(prop.properties, vn);
@@ -1675,7 +1825,7 @@ function renderFieldEditor(apiId) {
     return;
   }
 
-  const TYPES = ['string','integer','number','boolean','array','object'];
+  const TYPES = ['string','integer','number','boolean','array','object','date'];
   container.innerHTML = `
     <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:4px">
       <thead>
@@ -1691,14 +1841,14 @@ function renderFieldEditor(apiId) {
         ${fields.map((f, i) => {
           const isInject = f.value.startsWith('{{');
           const isArray  = f.type === 'array' || f.type === 'object';
+          const isDateF  = !isInject && !isArray && (f.type === 'date' || (f.type === 'string' && _isDateField(f.name)));
           const srcApi   = isInject ? _sourceApiForVar(f.value) : '';
 
-          const rowBg    = isInject ? 'background:rgba(108,99,255,.07)' : '';
+          const rowBg    = isInject ? 'background:rgba(108,99,255,.07)' : isDateF ? 'background:rgba(78,205,196,.04)' : '';
           const valStyle = isInject
             ? 'color:var(--accent);border-color:rgba(108,99,255,.5);font-weight:600'
             : isArray ? 'color:var(--warning);font-size:11px' : '';
 
-          // source label under field name
           const srcLabel = srcApi
             ? `<div style="font-size:10px;color:#a29bfe;margin-top:2px">⛓ from <strong>${escHtml(srcApi)}</strong></div>`
             : '';
@@ -1707,14 +1857,22 @@ function renderFieldEditor(apiId) {
             ? `<span style="font-size:9px;background:rgba(108,99,255,.25);color:#a29bfe;padding:1px 6px;border-radius:3px;white-space:nowrap">AUTO-INJECT</span>`
             : isArray
               ? `<span style="font-size:9px;background:rgba(255,165,0,.2);color:var(--warning);padding:1px 6px;border-radius:3px">ARRAY</span>`
-              : '';
+              : isDateF
+                ? `<span style="font-size:9px;background:rgba(78,205,196,.2);color:var(--accent2);padding:1px 6px;border-radius:3px">DATE</span>`
+                : '';
 
           const actionCell = (!isInject && !isArray)
-            ? `<button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:13px" title="Generate random"
+            ? `<button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:13px" title="${isDateF ? 'Random date in current format' : 'Generate random'}"
                 onclick="randomField('${apiId}',${i});document.getElementById('field-val-${apiId}-${i}').value=state.postFields['${apiId}'][${i}].value;updateJsonPreview('${apiId}')">🎲</button>`
             : (isInject
                 ? `<span title="Auto-injected from previous API" style="font-size:16px;cursor:default">⛓</span>`
                 : `<span style="color:var(--text-dim)">·</span>`);
+
+          const dateFmtSelect = isDateF ? `
+            <select style="width:100%;font-size:11px;padding:3px 5px;margin-bottom:3px;color:var(--accent2);border-color:rgba(78,205,196,.4)"
+              onchange="onDateFormatChange('${apiId}',${i},this.value,false)">
+              ${DATE_FORMATS.map(df => `<option value="${df.key}" ${(f.dateFormat||'YYYY-MM-DD')===df.key?'selected':''}>${df.label}</option>`).join('')}
+            </select>` : '';
 
           return `<tr style="border-bottom:1px solid rgba(46,49,71,.4);${rowBg}">
             <td style="padding:6px 8px;vertical-align:middle">
@@ -1735,14 +1893,15 @@ function renderFieldEditor(apiId) {
               <div style="margin-top:3px">${typeBadge}</div>
             </td>
             <td style="padding:5px 6px;vertical-align:middle">
+              ${dateFmtSelect}
               <input id="field-val-${apiId}-${i}"
                 style="font-family:var(--mono);font-size:12px;${valStyle}"
                 value="${escHtml(f.value)}"
-                placeholder="${isInject ? '{{var}}' : isArray ? '[{"id":"{{var}}"}]' : 'enter value'}"
+                placeholder="${isInject ? '{{var}}' : isArray ? '[{"id":"{{var}}"}]' : isDateF ? 'YYYY-MM-DD' : 'enter value'}"
                 oninput="syncFieldValue('${apiId}',${i},this.value);updateJsonPreview('${apiId}')"/>
             </td>
             <td style="padding:5px 4px;text-align:center;vertical-align:middle">
-              <button class="btn btn-danger btn-sm" style="padding:3px 7px" onclick="removeField('${apiId}',${i})">✕</button>
+              ${actionCell}
             </td>
           </tr>`;
         }).join('')}

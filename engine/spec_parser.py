@@ -166,9 +166,10 @@ def _get_request_body_schema(operation: Dict, spec: Dict, ver: int) -> Optional[
     rb = operation.get("requestBody", {})
     if "$ref" in rb:
         rb = _resolve_ref(rb["$ref"], spec)
-    for ct in ["application/json", "application/x-www-form-urlencoded"]:
-        if ct in rb.get("content", {}):
-            return _resolve_schema(rb["content"][ct].get("schema", {}), spec)
+    content = rb.get("content", {})
+    for ct_key in content:
+        if ct_key.startswith("application/json") or ct_key.startswith("application/x-www-form-urlencoded"):
+            return _resolve_schema(content[ct_key].get("schema", {}), spec)
     return None
 
 
@@ -183,9 +184,10 @@ def _get_response_schema(operation: Dict, spec: Dict, ver: int) -> Optional[Dict
         if ver == 2:
             s = resp.get("schema", {})
             return _resolve_schema(s, spec) if s else None
-        for ct in ["application/json"]:
-            if ct in resp.get("content", {}):
-                return _resolve_schema(resp["content"][ct].get("schema", {}), spec)
+        content = resp.get("content", {})
+        for ct_key in content:
+            if ct_key.startswith("application/json"):
+                return _resolve_schema(content[ct_key].get("schema", {}), spec)
     return None
 
 
