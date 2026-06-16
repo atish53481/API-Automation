@@ -56,6 +56,12 @@ def fetch_oauth2_token(auth: "AuthConfig", verify_ssl: bool = True, timeout: int
         return str(token)
 
 
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 def execute_request(
     method: str,
     url: str,
@@ -67,17 +73,19 @@ def execute_request(
     timeout: int = 30,
 ) -> Dict[str, Any]:
     all_headers = {
+        "User-Agent": _BROWSER_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "application/json",
-        "Accept": "application/json",
         **_auth_headers(auth),
-        **(headers or {}),
+        **(headers or {}),  # user custom headers override defaults
     }
     all_params = {**_auth_params(auth), **(params or {})}
     send_body = body if method.upper() in ("POST", "PUT", "PATCH") and body is not None else None
 
     t0 = time.monotonic()
     try:
-        with httpx.Client(verify=verify_ssl, timeout=timeout) as client:
+        with httpx.Client(verify=verify_ssl, timeout=timeout, follow_redirects=True) as client:
             resp = client.request(
                 method=method.upper(),
                 url=url,
