@@ -26,7 +26,7 @@ Production URL: `https://api-chain-tester.vercel.app`
 
 ## Cache Busting
 
-`static/index.html` loads `app.js` and `style.css` with a `?v=N` version suffix (currently `?v=29`). **Always bump N** when editing either file — browser caches the old version otherwise.
+`static/index.html` loads `app.js` and `style.css` with a `?v=N` version suffix (currently `?v=30`). **Always bump N** when editing either file — browser caches the old version otherwise.
 
 ## Architecture
 
@@ -126,6 +126,23 @@ Ops are **spec-driven**: `_autoBootstrapFromSpec()` only enables operations that
 - `toggleTheme()` — toggles `body.light-mode` class; persists to `localStorage` key `act-theme`
 - `renderStep(step, i)` — structured inspect panel: WHAT HAPPENED / ROOT CAUSE / REQUEST / RESPONSE / VARIABLES / cURL copy; failed steps open by default
 - `quickFixCookieAuth(apiId)` — one-click adds `Cookie: token={{auth_token}}` to custom headers (shown on 403)
+
+### Browser run mode (Cloudflare bypass)
+
+The Run page has a **Run via** selector (`#run-mode-select`):
+- **Server** (default): `POST /api/run` → Vercel backend → httpx. Fast, but blocked by Cloudflare managed challenge on some APIs.
+- **Browser**: skips the backend entirely; runs via `fetch()` from the user's real browser. Passes Cloudflare bot detection because the request originates from a real browser with correct TLS fingerprint and JS execution.
+
+JS functions for browser mode (all in `app.js`):
+- `_runStepsClientSide(chain)` — iterates `chain.execution_steps`, calls `fetch()` per step, propagates context, returns a `RunResult`-shaped object fed into the same `renderResults()` UI
+- `_cInject(val, ctx)` — JS equivalent of `inject_context`: replaces `{{var}}` recursively in strings/objects/arrays
+- `_cResolvePath(path, ctx)` — JS equivalent of `resolve_path`: replaces `{param}` in URL paths
+- `_cDotGet(obj, path)` — dot-path value extraction (e.g. `data.user.id`)
+- `_cAuthHeaders(auth)` — builds `Authorization` header from auth config (Bearer/Basic/API Key)
+
+### Outgoing request headers (`engine/executor.py`)
+
+All server-side requests sent with Chrome browser User-Agent + `Accept-Language: en-US,en;q=0.9` to avoid basic bot detection. `httpx.Client` uses `follow_redirects=True`. Cloudflare managed challenge (TLS fingerprint + JS challenge) still blocks server-mode; use Browser mode for Cloudflare-protected APIs.
 
 ### Access logging (Vercel)
 
