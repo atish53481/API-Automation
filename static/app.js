@@ -1943,6 +1943,103 @@ document.getElementById('btn-to-run').addEventListener('click', () => {
 // ── PAGE 4: Run ───────────────────────────────────────────────────────────────
 document.getElementById('btn-run').addEventListener('click', runChain);
 
+// ── Browser-mode client-side execution ───────────────────────────────────────
+// fetch() runs directly from the user's browser → bypasses Vercel server IPs.
+// Cloudflare / bot-protection sees a real browser making the request.
+
+function _cInject(val, ctx) {
+  if (typeof val === 'string') return val.replace(/\{\{(\w+)\}\}/g, (_, k) => ctx[k] ?? `{{${k}}}`);
+  if (Array.isArray(val))     return val.map(v => _cInject(v, ctx));
+  if (val && typeof val === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(val)) out[k] = _cInject(v, ctx);
+    return out;
+  }
+  return val;
+}
+
+function _cResolvePath(path, ctx) {
+  return path.replace(/\{(\w+)\}/g, (_, k) => ctx[k] ?? `{${k}}`);
+}
+
+function _cDotGet(obj, path) {
+  return path.split('.').reduce((o, k) => o?.[k], obj);
+}
+
+function _cAuthHeaders(auth) {
+  if (!auth || auth.type === 'none') return {};
+  if (auth.type === 'bearer')  return { Authorization: `Bearer ${auth.token || ''}` };
+  if (auth.type === 'basic')   return { Authorization: `Basic ${btoa((auth.username||'')+':'+(auth.password||''))}` };
+  if (auth.type === 'api_key' && auth.key_in === 'header') return { [auth.key_name]: auth.key_value };
+  return {};
+}
+
+async function _runStepsClientSide(chain) {
+  const ctx   = {};
+  const steps = [];
+  const opEndpointKey = { create:'post_endpoint', read:'get_endpoint', update:'put_endpoint', delete:'delete_endpoint' };
+  const opMethod      = { create:'POST', read:'GET', update:'PUT', delete:'DELETE' };
+
+  const activeSteps = (chain.execution_steps || []).filter(s => s.enabled);
+
+  for (const step of activeSteps) {
+    const apiCfg = chain.apis.find(a => a.id === step.api_id);
+    if (!apiCfg) continue;
+    const ep = apiCfg[opEndpointKey[step.operation]];
+    if (!ep) continue;
+
+    const method = opMethod[step.operation];
+    const url    = (apiCfg.base_url || '').replace(/\/$/, '') + _cResolvePath(ep.path, ctx);
+
+    let body = null;
+    if (method === 'POST') body = _cInject(apiCfg.post_body, ctx) || null;
+    if (method === 'PUT')  body = _cInject(apiCfg.put_body || apiCfg.post_body, ctx) || null;
+
+    const effAuth    = (apiCfg.auth?.type && apiCfg.auth.type !== 'none') ? apiCfg.auth : chain.auth;
+    const customHdrs = {};
+    for (const [k, v] of Object.entries(apiCfg.custom_headers || {}))
+      customHdrs[k] = _cInject(v, ctx);
+
+    const headers = { 'Content-Type':'application/json', 'Accept':'application/json',
+                      ..._cAuthHeaders(effAuth), ...customHdrs };
+
+    const t0 = performance.now();
+    let status = null, respBody = null, success = false, error = null;
+    try {
+      const opts = { method, headers };
+      if (body !== null) opts.body = JSON.stringify(body);
+      const resp = await fetch(url, opts);
+      status = resp.status;
+      try { respBody = (resp.headers.get('content-type')||'').includes('json')
+              ? await resp.json() : await resp.text(); }
+      catch { respBody = await resp.text(); }
+      success = status >= 200 && status < 300;
+    } catch(e) { error = e.message; }
+
+    const ms = Math.round(performance.now() - t0);
+
+    // Extract context
+    const extracted = {};
+    if (success && respBody && typeof respBody === 'object' && !Array.isArray(respBody)) {
+      for (const [k, v] of Object.entries(respBody))
+        if (typeof v !== 'object' && v !== undefined)
+          { ctx[`${apiCfg.id}_${k}`] = v; extracted[`${apiCfg.id}_${k}`] = v; }
+      const idVal = respBody[apiCfg.id_field || 'id'];
+      if (idVal != null) { ctx[`${apiCfg.id}_id`] = idVal; extracted[`${apiCfg.id}_id`] = idVal; }
+      for (const ex of apiCfg.response_extracts || []) {
+        const val = _cDotGet(respBody, ex.field);
+        if (val != null) { ctx[ex.as_var] = val; extracted[ex.as_var] = val; }
+      }
+    }
+
+    steps.push({ api_id: apiCfg.id, api_name: apiCfg.name, operation: step.operation,
+      method, url, status_code: status, success, error, duration_ms: ms,
+      request_headers: headers, request_body: body, response_body: respBody, extracted });
+  }
+
+  return { success: steps.length > 0 && steps.every(s => s.success), steps, context: ctx };
+}
+
 async function runChain() {
   // sync typed field values from DOM → state
   state.apis.forEach(a => {
@@ -1952,26 +2049,22 @@ async function runChain() {
     });
   });
 
-  // Build chain config
   let chainConfig;
-  try {
-    chainConfig = buildChainConfig();
-  } catch(e) {
-    showResultBanner(false, 'Configuration error: ' + e.message);
-    return;
-  }
+  try { chainConfig = buildChainConfig(); }
+  catch(e) { showResultBanner(false, 'Configuration error: ' + e.message); return; }
 
-  // UI: loading
   document.getElementById('btn-run').disabled = true;
-  show('run-spinner');
-  hide('run-summary');
-  hide('btn-download-report');
-  hide('btn-save-session');
+  show('run-spinner'); hide('run-summary');
+  hide('btn-download-report'); hide('btn-save-session');
   document.getElementById('result-banner-container').innerHTML = '';
   document.getElementById('results-container').innerHTML = '';
 
+  const mode = document.getElementById('run-mode-select')?.value || 'server';
+
   try {
-    const result = await api('/api/run', { chain: chainConfig });
+    const result = mode === 'browser'
+      ? await _runStepsClientSide(chainConfig)
+      : await api('/api/run', { chain: chainConfig });
     renderResults(result);
   } catch(e) {
     showResultBanner(false, 'Request failed: ' + e.message);

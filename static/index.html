@@ -4,7 +4,7 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>API Chain Tester</title>
-  <link rel="stylesheet" href="/static/style.css?v=29"/>
+  <link rel="stylesheet" href="/static/style.css?v=30"/>
 </head>
 <body>
 <div class="app">
@@ -269,6 +269,13 @@
         <button class="btn btn-success" id="btn-run" style="min-width:140px">
           ▶ Run Chain
         </button>
+        <div style="display:flex;align-items:center;gap:6px">
+          <label style="font-size:11px;font-weight:700;color:var(--text-dim);white-space:nowrap;margin:0">Run via</label>
+          <select id="run-mode-select" style="font-size:12px;padding:5px 8px;width:auto" title="Server: requests go through Vercel backend. Browser: requests go directly from your browser (bypasses Cloudflare/bot-protection).">
+            <option value="server">&#x1F5A5; Server (default)</option>
+            <option value="browser">&#x1F310; Browser (bypass Cloudflare)</option>
+          </select>
+        </div>
         <div id="run-spinner" class="hidden"><div class="spinner"></div> Running…</div>
         <div class="run-summary hidden" id="run-summary">
           <span><span class="dot-success"></span> <span id="pass-count">0</span> passed</span>
@@ -290,7 +297,7 @@
   </main>
 </div>
 
-<script src="/static/app.js?v=29"></script>
+<script src="/static/app.js?v=30"></script>
 <script>
 (function() {
   var box = null;
