@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from engine.chain import extract_value, inject_context, resolve_path
 from engine.data_gen import generate_from_schema
-from engine.executor import execute_request
+from engine.executor import execute_request, fetch_oauth2_token
 from engine.spec_parser import parse_spec
 from models.schemas import (
     APIConfig,
@@ -197,6 +197,18 @@ def _run_chain_sync(chain: ChainConfig) -> RunResult:
     steps: List[StepResult] = []
     auth = chain.auth
     api_map = {api.id: api for api in chain.apis}
+
+    # OAuth2: fetch token before any steps; swap auth to bearer
+    if auth and auth.type == "oauth2":
+        try:
+            token = fetch_oauth2_token(auth, chain.verify_ssl, chain.timeout)
+            context["oauth2_access_token"] = token
+            auth = AuthConfig(type="bearer", token=token)
+        except Exception as exc:
+            return RunResult(
+                success=False, steps=[], context=context,
+                error=f"OAuth2 token fetch failed: {exc}",
+            )
 
     if chain.execution_steps:
         # ── Dynamic: user-configured ordered step list ────────────────────────

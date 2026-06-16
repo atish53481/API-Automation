@@ -26,6 +26,36 @@ def _auth_params(auth: Optional[AuthConfig]) -> Dict[str, str]:
     return {}
 
 
+def fetch_oauth2_token(auth: "AuthConfig", verify_ssl: bool = True, timeout: int = 30) -> str:
+    """POST to token_url with client credentials or password grant; returns access_token string."""
+    if not auth.oauth2_token_url:
+        raise ValueError("OAuth2 token URL is required")
+    payload: Dict[str, str] = {
+        "grant_type":    auth.oauth2_grant_type or "client_credentials",
+        "client_id":     auth.oauth2_client_id     or "",
+        "client_secret": auth.oauth2_client_secret or "",
+    }
+    if auth.oauth2_scope:
+        payload["scope"] = auth.oauth2_scope
+    if (auth.oauth2_grant_type or "client_credentials") == "password":
+        payload["username"] = auth.oauth2_username or ""
+        payload["password"] = auth.oauth2_password or ""
+
+    with httpx.Client(verify=verify_ssl, timeout=timeout) as client:
+        resp = client.post(
+            auth.oauth2_token_url,
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token") or data.get("token") or data.get("id_token")
+        if not token:
+            raise ValueError(f"No access_token in OAuth2 response: {list(data.keys())}")
+        return str(token)
+
+
 def execute_request(
     method: str,
     url: str,

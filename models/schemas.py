@@ -3,13 +3,21 @@ from typing import Any, Dict, List, Optional, Literal
 
 
 class AuthConfig(BaseModel):
-    type: Literal["none", "bearer", "basic", "api_key"] = "none"
+    type: Literal["none", "bearer", "basic", "api_key", "oauth2"] = "none"
     token: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
     key_name: Optional[str] = None
     key_value: Optional[str] = None
     key_in: Optional[Literal["header", "query"]] = "header"
+    # OAuth 2.0 fields
+    oauth2_grant_type:    Optional[str] = "client_credentials"
+    oauth2_token_url:     Optional[str] = None
+    oauth2_client_id:     Optional[str] = None
+    oauth2_client_secret: Optional[str] = None
+    oauth2_scope:         Optional[str] = None
+    oauth2_username:      Optional[str] = None
+    oauth2_password:      Optional[str] = None
 
 
 class EndpointRef(BaseModel):

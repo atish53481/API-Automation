@@ -4,7 +4,7 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>API Chain Tester</title>
-  <link rel="stylesheet" href="/static/style.css?v=21"/>
+  <link rel="stylesheet" href="/static/style.css?v=26"/>
 </head>
 <body>
 <div class="app">
@@ -30,7 +30,10 @@
         <span class="nav-badge hidden" id="result-badge">0</span>
       </button>
     </nav>
-    <div class="sidebar-footer">v1.0 · 20yr Tester Edition</div>
+    <div class="sidebar-footer" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+      <span>API Chain Tester v1.0</span>
+      <button class="theme-toggle" id="theme-toggle-btn" onclick="toggleTheme()" title="Switch light/dark mode">🌙</button>
+    </div>
   </aside>
 
   <!-- ── Main content ── -->
@@ -59,6 +62,16 @@
         <div class="btn-group">
           <button class="btn btn-primary" id="btn-parse">🔍 Parse Spec</button>
           <button class="btn btn-secondary" id="btn-clear-spec">Clear</button>
+        </div>
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+          <label style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.6px;display:block;margin-bottom:8px">
+            Or load a saved session (skip re-import)
+          </label>
+          <input type="file" id="session-input" accept=".json" style="display:none"/>
+          <button class="btn btn-secondary" onclick="document.getElementById('session-input').click()">
+            📂 Load Session JSON
+          </button>
+          <span class="hint" style="margin-left:10px">Restores all endpoints, bodies, auth, and config</span>
         </div>
         <div id="parse-error" class="alert alert-error hidden" style="margin-top:10px"></div>
       </div>
@@ -138,6 +151,7 @@
               <option value="bearer">Bearer Token</option>
               <option value="basic">Basic Auth</option>
               <option value="api_key">API Key</option>
+              <option value="oauth2">OAuth 2.0 (auto-fetch token)</option>
             </select>
           </div>
         </div>
@@ -167,6 +181,54 @@
             </div>
           </div>
         </div>
+        <div id="auth-fields-oauth2" class="auth-section hidden">
+          <div class="form-row cols-2" style="margin-top:8px">
+            <div class="form-group">
+              <label>Grant Type</label>
+              <select id="oauth2-grant-type" onchange="toggleOAuth2PasswordFields()">
+                <option value="client_credentials">Client Credentials</option>
+                <option value="password">Resource Owner Password</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Token URL</label>
+              <input type="text" id="oauth2-token-url" placeholder="https://auth.example.com/oauth/token"/>
+            </div>
+          </div>
+          <div class="form-row cols-2">
+            <div class="form-group">
+              <label>Client ID</label>
+              <input type="text" id="oauth2-client-id" placeholder="your-client-id"/>
+            </div>
+            <div class="form-group">
+              <label>Client Secret</label>
+              <input type="password" id="oauth2-client-secret" placeholder="your-client-secret"/>
+            </div>
+          </div>
+          <div class="form-row cols-1">
+            <div class="form-group">
+              <label>Scope <span style="font-weight:400;color:var(--text-dim)">(optional, space-separated)</span></label>
+              <input type="text" id="oauth2-scope" placeholder="read write api"/>
+            </div>
+          </div>
+          <div id="oauth2-password-fields" style="display:none">
+            <div class="form-row cols-2">
+              <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="oauth2-username"/>
+              </div>
+              <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="oauth2-password"/>
+              </div>
+            </div>
+          </div>
+          <p class="hint" style="margin-top:6px">
+            Token fetched automatically before chain runs — injected as <code style="color:var(--accent)">Bearer</code> into all requests.
+            Also available as <code style="color:var(--accent)">{{oauth2_access_token}}</code>.
+          </p>
+        </div>
+
         <div id="auth-fields-api_key" class="auth-section hidden">
           <div class="form-row cols-3">
             <div class="form-group">
@@ -212,6 +274,12 @@
           <span><span class="dot-success"></span> <span id="pass-count">0</span> passed</span>
           <span><span class="dot-error"></span> <span id="fail-count">0</span> failed</span>
         </div>
+        <button class="btn btn-secondary hidden" id="btn-download-report" onclick="downloadReport()">
+          📥 Download HTML Report
+        </button>
+        <button class="btn btn-secondary hidden" id="btn-save-session" onclick="saveSession()">
+          💾 Save Session JSON
+        </button>
       </div>
 
       <div id="run-sequence"></div>
@@ -222,7 +290,7 @@
   </main>
 </div>
 
-<script src="/static/app.js?v=21"></script>
+<script src="/static/app.js?v=26"></script>
 <script>
 (function() {
   var box = null;

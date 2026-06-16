@@ -118,7 +118,7 @@ function _autoBootstrapFromSpec() {
       create: !!postEp,
       read:   !!getEp,
       update: !!putEp,
-      delete: false,   // always opt-in: last operation in a cascade should be intentional
+      delete: !!deleteEp,
     };
 
     // Use response schema from spec when available
@@ -739,6 +739,25 @@ dropZone.addEventListener('drop', e => {
 });
 fileInput.addEventListener('change', () => { if (fileInput.files[0]) readFile(fileInput.files[0]); });
 
+// Session JSON load
+const sessionInput = document.getElementById('session-input');
+if (sessionInput) {
+  sessionInput.addEventListener('change', () => {
+    const file = sessionInput.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        _applySession(JSON.parse(ev.target.result));
+      } catch(e) {
+        alert('Failed to parse session file: ' + e.message);
+      }
+    };
+    reader.readAsText(file);
+    sessionInput.value = ''; // allow re-selecting same file
+  });
+}
+
 function readFile(file) {
   const reader = new FileReader();
   reader.onload = ev => { document.getElementById('spec-text').value = ev.target.result; };
@@ -880,7 +899,7 @@ function autoAssignFromResource(resource, apiId) {
     create: !!postEp,
     read:   !!getEp,
     update: !!putEp,
-    delete: state.apiOps[apiId]?.delete || false,
+    delete: !!deleteEp,
   };
 
   // Response schema: spec → auth heuristic → body-fallback (wraps body under resource key)
@@ -1169,6 +1188,12 @@ document.getElementById('auth-type').addEventListener('change', function() {
   if (section) section.classList.remove('hidden');
   if (this.value === 'bearer') renderAuthTokenPicker();
 });
+
+function toggleOAuth2PasswordFields() {
+  const grant = document.getElementById('oauth2-grant-type')?.value;
+  const pwEl  = document.getElementById('oauth2-password-fields');
+  if (pwEl) pwEl.style.display = grant === 'password' ? '' : 'none';
+}
 
 // ── Shared: all {{vars}} from all APIs (recursive into nested schemas) ────────
 function _allApiVars() {
@@ -1781,6 +1806,8 @@ async function runChain() {
   document.getElementById('btn-run').disabled = true;
   show('run-spinner');
   hide('run-summary');
+  hide('btn-download-report');
+  hide('btn-save-session');
   document.getElementById('result-banner-container').innerHTML = '';
   document.getElementById('results-container').innerHTML = '';
 
@@ -1808,6 +1835,15 @@ function buildChainConfig() {
     auth.key_name  = document.getElementById('auth-key-name').value;
     auth.key_value = document.getElementById('auth-key-value').value;
     auth.key_in    = document.getElementById('auth-key-in').value;
+  }
+  if (authType === 'oauth2') {
+    auth.oauth2_grant_type    = document.getElementById('oauth2-grant-type').value;
+    auth.oauth2_token_url     = document.getElementById('oauth2-token-url').value;
+    auth.oauth2_client_id     = document.getElementById('oauth2-client-id').value;
+    auth.oauth2_client_secret = document.getElementById('oauth2-client-secret').value;
+    auth.oauth2_scope         = document.getElementById('oauth2-scope').value;
+    auth.oauth2_username      = document.getElementById('oauth2-username').value;
+    auth.oauth2_password      = document.getElementById('oauth2-password').value;
   }
 
   const apis = state.apis.map(a => {
@@ -2154,14 +2190,9 @@ function renderResults(result) {
   badge.style.background = failCount > 0 ? 'var(--error)' : 'var(--success)';
   show(badge);
 
-  // Download report button
-  const bannerEl = document.getElementById('result-banner-container');
-  bannerEl.insertAdjacentHTML('beforeend',
-    `<div style="margin-bottom:12px">
-       <button class="btn btn-secondary" onclick="downloadReport()">
-         📥 Download HTML Report
-       </button>
-     </div>`);
+  // Show download + save-session buttons at top of Run page
+  show('btn-download-report');
+  show('btn-save-session');
 
   const container = document.getElementById('results-container');
   container.innerHTML = result.steps.map((step, i) => renderStep(step, i)).join('');
@@ -2379,6 +2410,147 @@ function jsonStr(v) {
 }
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Theme toggle ─────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const light = document.body.classList.toggle('light-mode');
+  const btn   = document.getElementById('theme-toggle-btn');
+  if (btn) btn.textContent = light ? '☀️' : '🌙';
+  try { localStorage.setItem('act-theme', light ? 'light' : 'dark'); } catch {}
+}
+
+// Apply persisted theme on load
+(function() {
+  try {
+    if (localStorage.getItem('act-theme') === 'light') {
+      document.body.classList.add('light-mode');
+      document.addEventListener('DOMContentLoaded', () => {
+        const btn = document.getElementById('theme-toggle-btn');
+        if (btn) btn.textContent = '☀️';
+      });
+    }
+  } catch {}
+})();
+
+// ── Session Save / Load ───────────────────────────────────────────────────────
+function saveSession() {
+  // Sync any live DOM values into state first
+  state.apis.forEach(a => {
+    const urlEl  = document.getElementById(`base-url-${a.id}`);
+    const nameEl = document.getElementById(`api-name-${a.id}`);
+    if (urlEl)  state.baseUrls[a.id] = urlEl.value;
+    if (nameEl) a.name = nameEl.value;
+    ['post','get','put','delete'].forEach(m => {
+      const sel = document.getElementById(`sel-${a.id}-${m}`);
+      if (sel) state.selections[a.id][m] = sel.value;
+    });
+    (state.postFields[a.id] || []).forEach((f, i) => {
+      const inp = document.getElementById(`field-val-${a.id}-${i}`);
+      if (inp) f.value = inp.value;
+    });
+  });
+
+  const authType = document.getElementById('auth-type')?.value || 'none';
+  const session = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    spec: state.spec,
+    endpoints: state.endpoints,
+    apis: state.apis,
+    selections: state.selections,
+    baseUrls: state.baseUrls,
+    idFields: state.idFields,
+    postFields: state.postFields,
+    putFields: state.putFields,
+    selectedResources: state.selectedResources,
+    apiOps: state.apiOps,
+    apiHeaders: state.apiHeaders,
+    apiAuth: state.apiAuth,
+    responseSchemas: state.responseSchemas,
+    mappings: state.mappings,
+    executionSteps: state.executionSteps,
+    _authTokenVar: state._authTokenVar,
+    _authApiId: state._authApiId,
+    globalAuth: {
+      type:              authType,
+      token:             document.getElementById('auth-token')?.value          || '',
+      username:          document.getElementById('auth-username')?.value       || '',
+      password:          document.getElementById('auth-password')?.value       || '',
+      keyName:           document.getElementById('auth-key-name')?.value       || '',
+      keyValue:          document.getElementById('auth-key-value')?.value      || '',
+      keyIn:             document.getElementById('auth-key-in')?.value         || 'header',
+      oauth2GrantType:   document.getElementById('oauth2-grant-type')?.value   || 'client_credentials',
+      oauth2TokenUrl:    document.getElementById('oauth2-token-url')?.value    || '',
+      oauth2ClientId:    document.getElementById('oauth2-client-id')?.value    || '',
+      oauth2ClientSecret:document.getElementById('oauth2-client-secret')?.value|| '',
+      oauth2Scope:       document.getElementById('oauth2-scope')?.value        || '',
+      oauth2Username:    document.getElementById('oauth2-username')?.value     || '',
+      oauth2Password:    document.getElementById('oauth2-password')?.value     || '',
+    },
+  };
+
+  const blob = new Blob([JSON.stringify(session, null, 2)], { type: 'application/json' });
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
+  const name = (state.spec?.title || 'api-chain').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  a.download = `${name}-session-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+}
+
+function _applySession(data) {
+  if (!data || data.version !== 1) { alert('Invalid session file — version mismatch.'); return; }
+
+  state.spec              = data.spec              || null;
+  state.endpoints         = data.endpoints         || [];
+  state.apis              = data.apis              || [];
+  state.selections        = data.selections        || {};
+  state.baseUrls          = data.baseUrls          || {};
+  state.idFields          = data.idFields          || {};
+  state.postFields        = data.postFields        || {};
+  state.putFields         = data.putFields         || {};
+  state.selectedResources = data.selectedResources || {};
+  state.apiOps            = data.apiOps            || {};
+  state.apiHeaders        = data.apiHeaders        || {};
+  state.apiAuth           = data.apiAuth           || {};
+  state.responseSchemas   = data.responseSchemas   || {};
+  state.mappings          = data.mappings          || [];
+  state.executionSteps    = data.executionSteps    || [];
+  state._authTokenVar     = data._authTokenVar     || null;
+  state._authApiId        = data._authApiId        || null;
+
+  // Restore global auth
+  const ga    = data.globalAuth || {};
+  const typeEl = document.getElementById('auth-type');
+  if (typeEl) {
+    typeEl.value = ga.type || 'none';
+    typeEl.dispatchEvent(new Event('change'));
+  }
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+  setVal('auth-token',           ga.token);
+  setVal('auth-username',        ga.username);
+  setVal('auth-password',        ga.password);
+  setVal('auth-key-name',        ga.keyName);
+  setVal('auth-key-value',       ga.keyValue);
+  const keyInEl = document.getElementById('auth-key-in');
+  if (keyInEl) keyInEl.value = ga.keyIn || 'header';
+  setVal('oauth2-grant-type',    ga.oauth2GrantType);
+  setVal('oauth2-token-url',     ga.oauth2TokenUrl);
+  setVal('oauth2-client-id',     ga.oauth2ClientId);
+  setVal('oauth2-client-secret', ga.oauth2ClientSecret);
+  setVal('oauth2-scope',         ga.oauth2Scope);
+  setVal('oauth2-username',      ga.oauth2Username);
+  setVal('oauth2-password',      ga.oauth2Password);
+  toggleOAuth2PasswordFields();
+
+  // Re-populate spec panel if spec present
+  if (state.spec && state.endpoints.length) {
+    renderEndpointList(state.spec);
+    show('spec-result');
+  }
+
+  navigateTo('chain');
+  alert(`✅ Session loaded: ${data.spec?.title || 'API Chain'}\n${state.apis.length} API(s) restored — proceed to Run when ready.`);
 }
 
 // ── HTML Report Generator ─────────────────────────────────────────────────────
