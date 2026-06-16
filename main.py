@@ -1,10 +1,19 @@
+import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+logger = logging.getLogger("api-chain")
 
 from engine.chain import extract_value, inject_context, resolve_path
 from engine.data_gen import generate_from_schema
@@ -22,6 +31,25 @@ from models.schemas import (
 )
 
 app = FastAPI(title="API Chain Tester", version="1.0.0")
+
+
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    start = time.time()
+    # Real IP: Vercel sets X-Forwarded-For
+    ip = (request.headers.get("x-forwarded-for") or
+          request.headers.get("x-real-ip") or
+          (request.client.host if request.client else "unknown"))
+    ip = ip.split(",")[0].strip()
+    ua = request.headers.get("user-agent", "-")
+    response = await call_next(request)
+    ms = int((time.time() - start) * 1000)
+    logger.info(
+        "ACCESS ip=%s method=%s path=%s status=%s duration=%dms ua=%r",
+        ip, request.method, request.url.path, response.status_code, ms, ua,
+    )
+    return response
+
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
