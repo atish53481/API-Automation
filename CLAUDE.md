@@ -16,13 +16,17 @@ pip install -r requirements.txt
 python main.py
 # or
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# Deploy to Vercel (production)
+vercel --prod --yes
 ```
 
-No test suite is configured. The app exposes a browser UI at `http://localhost:8000`.
+No test suite is configured. The app exposes a browser UI at `http://localhost:8000`.  
+Production URL: `https://api-chain-tester.vercel.app`
 
 ## Cache Busting
 
-`static/index.html` loads `app.js` and `style.css` with a `?v=N` version suffix (e.g. `?v=21`). **Always bump N** when editing either file — browser caches the old version otherwise. Hard-refresh (`Ctrl+Shift+R`) required after server restart.
+`static/index.html` loads `app.js` and `style.css` with a `?v=N` version suffix (currently `?v=29`). **Always bump N** when editing either file — browser caches the old version otherwise.
 
 ## Architecture
 
@@ -36,9 +40,9 @@ No test suite is configured. The app exposes a browser UI at `http://localhost:8
 
 After each successful response, values flow into a shared `context: Dict[str, Any]`:
 
-1. **Auto-extract**: every scalar field in the response body stored as `{api_id}_{field}` (e.g. API id `auth` + response `{"token":"abc"}` → `context["auth_token"] = "abc"`)
+1. **Auto-extract**: every scalar field in the response body stored as `{api_id}_{field}`
 2. **ID shortcut**: `id_field` (default `"id"`) always stored as `{api_id}_id`
-3. **User extracts**: `response_extracts` list with dot-path notation (`data.user.id`) stored under any variable name
+3. **User extracts**: `response_extracts` list with dot-path notation stored under any variable name
 
 Context injection syntaxes:
 - `{{var}}` in body / header values / bearer token → `engine/chain.inject_context()` (recursive, handles dict/list)
@@ -49,7 +53,7 @@ Context injection syntaxes:
 ### Execution modes
 
 - **Dynamic** (`ChainConfig.execution_steps` set): runs each `ExecutionStep` in order; any step can be enabled/disabled
-- **Legacy** (no `execution_steps`): fixed phases — all CREATEs → all READs → all UPDATEs → all DELETEs (reversed by default, or set via `delete_order`)
+- **Legacy** (no `execution_steps`): fixed phases — all CREATEs → all READs → all UPDATEs → all DELETEs (reversed)
 
 ### Auth resolution
 
@@ -57,22 +61,34 @@ Auth is re-resolved after every step (`main._resolve_auth()`), so `{{auth_token}
 
 Per-API auth (`APIConfig.auth`) overrides global chain auth (`ChainConfig.auth`); falls back to global if per-API auth is absent or `"none"`.
 
+OAuth 2.0: `engine/executor.fetch_oauth2_token(auth)` is called in `_run_chain_sync()` before the chain starts. The fetched token is stored as `context["oauth2_access_token"]` and injected as Bearer into all subsequent requests. Supports `client_credentials` and `password` grant types.
+
+### Resource grouping (`groupByResource`)
+
+Uses `ep.tags[0]` from OpenAPI spec as the authoritative resource name. Falls back to first non-version, non-param path segment when tags are absent. Version prefixes (`/api`, `/v1`, `/rest`) are skipped via regex. This drives how endpoints are grouped into API panels on the Configure Chain page.
+
+### Spec parser
+
+`engine/spec_parser.py` handles OpenAPI v2/v3 (JSON or YAML) and Postman Collection v2.0/v2.1. Content-type matching uses `startswith()` prefix match (not exact equality) to handle versioned types like `application/json; v=1.0`.
+
 ### Module map
 
 | Module | Responsibility |
 |---|---|
-| `main.py` | FastAPI app, route handlers, chain execution orchestration |
+| `main.py` | FastAPI app, HTTP access logging middleware, route handlers, chain execution orchestration |
 | `engine/chain.py` | `extract_value` (dot-path/JSONPath), `inject_context` (`{{var}}`), `resolve_path` (`{param}`) |
-| `engine/executor.py` | httpx HTTP client; builds auth headers/params; returns normalized result dict |
-| `engine/spec_parser.py` | Parses OpenAPI v2/v3 (JSON or YAML) and Postman Collection v2.0/v2.1 into `ParseSpecResponse` |
+| `engine/executor.py` | httpx HTTP client; `execute_request()` builds auth headers/params; `fetch_oauth2_token()` for OAuth2 pre-fetch |
+| `engine/spec_parser.py` | Parses OpenAPI v2/v3 and Postman Collection into `ParseSpecResponse` |
 | `engine/data_gen.py` | Generates random request bodies from JSON Schema; uses Faker when available |
-| `models/schemas.py` | All Pydantic models |
+| `models/schemas.py` | All Pydantic models; `AuthConfig` includes oauth2 fields |
 | `static/` | SPA: `index.html` + `app.js` + `style.css` |
+| `vercel.json` | Vercel deployment config — routes all requests through `main.py` via `@vercel/python` |
 
 ### Key Pydantic models
 
 - `ChainConfig` — top-level run config: list of `APIConfig`, global auth, SSL, timeout, optional `execution_steps`
 - `APIConfig` — one API group: base URL, per-verb endpoints, bodies, `response_extracts`, per-API `auth`, `custom_headers`, `ops` toggles
+- `AuthConfig` — `type` ∈ `{none, bearer, basic, api_key, oauth2}`; oauth2 fields: `oauth2_grant_type`, `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_username`, `oauth2_password`
 - `ExecutionStep` — `{api_id, operation: "create"|"read"|"update"|"delete", enabled}`
 - `StepResult` — one HTTP call result: request/response bodies, headers, duration, `extracted` vars
 - `RunResult` — aggregated: overall success, all steps, final context state
@@ -84,21 +100,33 @@ Key `state` fields that drive the UI and `buildChainConfig()`:
 | Field | Purpose |
 |---|---|
 | `state.apis[]` | `{id, name, baseUrl, endpoints[]}` — discovered from spec |
-| `state.apiOps[apiId]` | `{create, read, update, delete}` booleans — auto-derived from which endpoints exist in spec |
-| `state.apiAuth[apiId]` | Per-API auth override `{type, token, username, password, key_name, key_value, key_in}` |
+| `state.apiOps[apiId]` | `{create, read, update, delete}` booleans — spec-driven, never forced |
+| `state.apiAuth[apiId]` | Per-API auth override |
 | `state.apiHeaders[apiId]` | Custom headers object for each API |
-| `state.postBodies[apiId]` | POST body dict |
-| `state.putBodies[apiId]` | PUT body dict (falls back to POST body) |
+| `state.postFields[apiId]` | `[{name, type, value, random, dateFormat?}]` — POST body fields; `dateFormat` set on date-detected fields |
+| `state.putFields[apiId]` | Same structure as postFields, for PUT body |
+| `state.baseUrls[apiId]` | Per-API base URL; seeded from global base URL card or `spec.base_url` |
 | `state.executionSteps[]` | `{uid, apiId, operation, enabled}` — ordered execution list |
-| `state._authTokenVar` | Variable name of the auth token (e.g. `"auth_token"`) for quick-fix features |
+| `state._authTokenVar` | Variable name of the auth token for quick-fix features |
 
-Ops are **spec-driven**: `_autoBootstrapFromSpec()` only enables operations that have actual endpoints in the parsed spec. Never force CRUD operations that the spec doesn't define.
+Ops are **spec-driven**: `_autoBootstrapFromSpec()` only enables operations that have actual endpoints in the parsed spec.
+
+### Date field detection
+
+`_isDateField(name)` splits camelCase (e.g. `bookingDate` → `booking Date`) and tests against keywords: `date, dob, birth, creat, updat, modif, start, end, expir, issu, due, sent, receiv, timestamp`. Also triggered by OpenAPI `format: date` or `format: date-time`. Detected fields get `dateFormat: 'YYYY-MM-DD'` and today's date as default value — no manual input needed. `DATE_FORMATS` array holds 16 formats; `_applyDateFmt(fmt, randomize)` produces the formatted string.
 
 ### Key frontend functions
 
 - `buildChainConfig()` — assembles `ChainConfig` from all state, sent to `POST /api/run`
-- `_autoBootstrapFromSpec()` — populates `state.apis`, `state.apiOps`, `state._authTokenVar` from parsed spec
-- `renderRunPage()` — renders reorderable step list + calls `_renderWorkflowPreview()`
-- `_renderWorkflowPreview(steps)` — numbered preview of execution order with phase dividers, captured-var annotations, path-param usage, and skipped-step indicators
-- `renderStep(step, i)` — structured inspect panel: WHAT HAPPENED / ROOT CAUSE / REQUEST / RESPONSE / VARIABLES / cURL copy button; failed steps open by default
-- `quickFixCookieAuth(apiId)` — one-click adds `Cookie: token={{auth_token}}` to custom headers (shown when step returns 403)
+- `_autoBootstrapFromSpec()` — populates `state.apis`, `state.apiOps`, `state.baseUrls`, `state._authTokenVar` from parsed spec
+- `applyGlobalBaseUrl(url)` — propagates a single URL to all `state.baseUrls` and live DOM inputs; called on render if `spec.base_url` exists
+- `renderChainPage()` — renders Global Base URL card (auto-fills from spec, shows ✓/⚠ hint) + API panels
+- `onDateFormatChange(apiId, idx, fmt, isPut)` — updates `f.dateFormat`, recomputes `f.value`, syncs DOM input
+- `saveSession()` / `_applySession(data)` — full round-trip JSON: serializes all state + auth DOM values; restores on load, skipping re-import
+- `toggleTheme()` — toggles `body.light-mode` class; persists to `localStorage` key `act-theme`
+- `renderStep(step, i)` — structured inspect panel: WHAT HAPPENED / ROOT CAUSE / REQUEST / RESPONSE / VARIABLES / cURL copy; failed steps open by default
+- `quickFixCookieAuth(apiId)` — one-click adds `Cookie: token={{auth_token}}` to custom headers (shown on 403)
+
+### Access logging (Vercel)
+
+`main.py` has an HTTP middleware that logs every request: `ip`, `method`, `path`, `status`, `duration`, `user-agent`. Real IP extracted from `X-Forwarded-For` (set by Vercel). View logs in Vercel dashboard → Functions tab, or via `vercel logs api-chain-tester.vercel.app --follow`.
