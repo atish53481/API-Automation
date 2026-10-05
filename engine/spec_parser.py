@@ -34,24 +34,41 @@ def _flatten_postman_items(items: List) -> List[Dict]:
     return result
 
 
-def _parse_postman_url(url_obj) -> tuple:
+def _resolve_postman_vars(value: Any, vars: Dict[str, Any]) -> str:
+    """Replace Postman {{variable}} placeholders from the collection's variable list."""
+    if not isinstance(value, str) or "{{" not in value:
+        return value
+    return re.sub(
+        r"\{\{\s*([^}]+?)\s*\}\}",
+        lambda m: str(vars.get(m.group(1).strip(), m.group(0))),
+        value,
+    )
+
+
+def _parse_postman_url(url_obj, vars: Optional[Dict[str, Any]] = None) -> tuple:
     """Return (base_url, path) from a Postman URL object or raw string."""
+    vars = vars or {}
+
     if isinstance(url_obj, str):
-        p = urlparse(url_obj)
+        p = urlparse(_resolve_postman_vars(url_obj, vars))
         base = f"{p.scheme}://{p.netloc}" if p.netloc else ""
         return base, p.path or "/"
 
-    raw = url_obj.get("raw", "")
+    raw = _resolve_postman_vars(url_obj.get("raw", ""), vars)
     protocol = url_obj.get("protocol", "https")
     host_parts = url_obj.get("host", [])
     path_parts = url_obj.get("path", [])
 
     host = ".".join(host_parts) if isinstance(host_parts, list) else str(host_parts)
-    base = f"{protocol}://{host}" if host else ""
+    host = _resolve_postman_vars(host, vars)
+    if host:
+        base = host if re.match(r"^https?://", host) else f"{protocol}://{host}"
+    else:
+        base = ""
 
     # Convert path segments; replace numeric-only segments with {id}
     def seg(p):
-        s = str(p)
+        s = _resolve_postman_vars(p, vars)
         return "{id}" if re.fullmatch(r"\d+", s) else s
 
     path = "/" + "/".join(seg(p) for p in path_parts) if path_parts else (urlparse(raw).path or "/")
@@ -62,6 +79,13 @@ def _parse_postman_collection(spec: Dict) -> ParseSpecResponse:
     info = spec.get("info", {})
     title = info.get("name", "API")
 
+    # Resolve collection variables (e.g. {{baseUrl}}) used inside URLs
+    vars = {
+        v.get("key"): v.get("value", "")
+        for v in spec.get("variable", [])
+        if isinstance(v, dict)
+    }
+
     flat = _flatten_postman_items(spec.get("item", []))
     base_url = None
     endpoints = []
@@ -70,7 +94,7 @@ def _parse_postman_collection(spec: Dict) -> ParseSpecResponse:
         req = req_item.get("request", {})
         method = req.get("method", "GET").upper()
         url_obj = req.get("url", {})
-        item_base, path = _parse_postman_url(url_obj)
+        item_base, path = _parse_postman_url(url_obj, vars)
         if item_base and not base_url:
             base_url = item_base
 
