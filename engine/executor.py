@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from engine.chain import extract_value
 from models.schemas import AuthConfig
 
 
@@ -17,12 +18,22 @@ def _auth_headers(auth: Optional[AuthConfig]) -> Dict[str, str]:
         return {"Authorization": f"Basic {creds}"}
     if auth.type == "api_key" and auth.key_in == "header":
         return {auth.key_name: auth.key_value}
+    if auth.type == "login" and auth.token:
+        mode = auth.login_apply_as or "cookie"
+        if mode == "cookie":
+            return {"Cookie": f"{auth.login_apply_name or 'token'}={auth.token}"}
+        if mode == "bearer":
+            return {"Authorization": f"Bearer {auth.token}"}
+        if mode == "header":
+            return {auth.login_apply_name or "Authorization": f"{auth.login_apply_prefix or ''}{auth.token}"}
     return {}
 
 
 def _auth_params(auth: Optional[AuthConfig]) -> Dict[str, str]:
     if auth and auth.type == "api_key" and auth.key_in == "query":
         return {auth.key_name: auth.key_value}
+    if auth and auth.type == "login" and auth.token and auth.login_apply_as == "query":
+        return {auth.login_apply_name or "token": auth.token}
     return {}
 
 
@@ -62,6 +73,70 @@ _BROWSER_UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+
+def run_login_request(auth: AuthConfig, verify_ssl: bool = True, timeout: int = 30) -> Dict[str, Any]:
+    """Send the login request imported from cURL and pull the token out of its response.
+
+    Never raises: returns status_code, response_body, token (None on failure) and error.
+    """
+    result: Dict[str, Any] = {"success": False, "status_code": None, "response_body": None,
+                              "token": None, "error": None}
+    if not auth.login_url:
+        result["error"] = "Login request URL is required"
+        return result
+
+    headers = {"User-Agent": _BROWSER_UA, "Accept": "application/json"}
+    body = auth.login_body or None
+    if body is not None:
+        # curl -d default is form-encoded; assume JSON when the body looks like JSON
+        looks_json = body.lstrip()[:1] in ("{", "[")
+        headers["Content-Type"] = "application/json" if looks_json else "application/x-www-form-urlencoded"
+    headers.update(auth.login_headers or {})  # headers from the cURL override defaults
+
+    try:
+        with httpx.Client(verify=verify_ssl, timeout=timeout, follow_redirects=True) as client:
+            resp = client.request(
+                method=(auth.login_method or "POST").upper(),
+                url=auth.login_url,
+                content=body.encode("utf-8") if body is not None else None,
+                headers=headers,
+            )
+    except httpx.TimeoutException:
+        result["error"] = f"Timeout after {timeout}s"
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+    try:
+        resp_body = resp.json()
+    except Exception:
+        resp_body = resp.text
+    result["status_code"] = resp.status_code
+    result["response_body"] = resp_body
+
+    if not 200 <= resp.status_code < 300:
+        result["error"] = f"HTTP {resp.status_code}: {str(resp_body)[:300]}"
+        return result
+
+    path = (auth.login_token_path or "").strip()
+    if path:
+        token = extract_value(resp_body, path)
+    else:
+        token = next(
+            (resp_body[k] for k in ("access_token", "token", "id_token")
+             if isinstance(resp_body, dict) and resp_body.get(k)),
+            None,
+        )
+    if token is None or isinstance(token, (dict, list)):
+        where = f"field '{path}'" if path else "access_token / token / id_token"
+        result["error"] = f"No token at {where} in login response: {str(resp_body)[:300]}"
+        return result
+
+    result["token"] = str(token)
+    result["success"] = True
+    return result
+
 def execute_request(
     method: str,
     url: str,
@@ -74,7 +149,7 @@ def execute_request(
 ) -> Dict[str, Any]:
     all_headers = {
         "User-Agent": _BROWSER_UA,
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "application/json",
         **_auth_headers(auth),

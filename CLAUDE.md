@@ -26,7 +26,7 @@ Production URL: `https://api-chain-tester.vercel.app`
 
 ## Cache Busting
 
-`static/index.html` loads `app.js` and `style.css` with a `?v=N` version suffix (currently `?v=30`). **Always bump N** when editing either file — browser caches the old version otherwise.
+`static/index.html` loads `app.js` and `style.css` with a `?v=N` version suffix (currently `?v=32`). **Always bump N** when editing either file — browser caches the old version otherwise.
 
 ## Architecture
 
@@ -63,6 +63,10 @@ Per-API auth (`APIConfig.auth`) overrides global chain auth (`ChainConfig.auth`)
 
 OAuth 2.0: `engine/executor.fetch_oauth2_token(auth)` is called in `_run_chain_sync()` before the chain starts. The fetched token is stored as `context["oauth2_access_token"]` and injected as Bearer into all subsequent requests. Supports `client_credentials` and `password` grant types.
 
+Login Request (import cURL): `AuthConfig.type == "login"`. The user pastes a login cURL in the Global Authentication card; `_parseCurl()` (app.js) fills the `login_*` fields. `engine/executor.run_login_request(auth)` sends it and extracts the token at `login_token_path` (dot path; falls back to `access_token`/`token`/`id_token`). It runs in `_run_chain_sync()` before the chain starts (fresh token every run) and via `POST /api/auth/test-login` for the UI's **Fetch token** preview. The token is stored as `context["login_token"]` and applied per `login_apply_as`: `cookie` (`Cookie: <name>=<token>`), `bearer`, `header` (`<name>: <prefix><token>`), or `query`. Cookie mode is Server-mode only — browsers refuse a `Cookie` header from `fetch()`.
+
+Pre-fetched auth (OAuth2 / login) is kept in `base_auth` inside `_run_chain_sync()` so the per-step `_resolve_auth()` does not drop it.
+
 ### Resource grouping (`groupByResource`)
 
 Uses `ep.tags[0]` from OpenAPI spec as the authoritative resource name. Falls back to first non-version, non-param path segment when tags are absent. Version prefixes (`/api`, `/v1`, `/rest`) are skipped via regex. This drives how endpoints are grouped into API panels on the Configure Chain page.
@@ -88,7 +92,7 @@ Uses `ep.tags[0]` from OpenAPI spec as the authoritative resource name. Falls ba
 
 - `ChainConfig` — top-level run config: list of `APIConfig`, global auth, SSL, timeout, optional `execution_steps`
 - `APIConfig` — one API group: base URL, per-verb endpoints, bodies, `response_extracts`, per-API `auth`, `custom_headers`, `ops` toggles
-- `AuthConfig` — `type` ∈ `{none, bearer, basic, api_key, oauth2}`; oauth2 fields: `oauth2_grant_type`, `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_username`, `oauth2_password`
+- `AuthConfig` — `type` ∈ `{none, bearer, basic, api_key, oauth2, login}`; login fields: `login_method`, `login_url`, `login_headers`, `login_body`, `login_token_path`, `login_apply_as`, `login_apply_name`, `login_apply_prefix`; oauth2 fields: `oauth2_grant_type`, `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_username`, `oauth2_password`
 - `ExecutionStep` — `{api_id, operation: "create"|"read"|"update"|"delete", enabled}`
 - `StepResult` — one HTTP call result: request/response bodies, headers, duration, `extracted` vars
 - `RunResult` — aggregated: overall success, all steps, final context state

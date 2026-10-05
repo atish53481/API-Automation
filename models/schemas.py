@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional, Literal
 
 
 class AuthConfig(BaseModel):
-    type: Literal["none", "bearer", "basic", "api_key", "oauth2"] = "none"
+    type: Literal["none", "bearer", "basic", "api_key", "oauth2", "login"] = "none"
     token: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
@@ -18,6 +18,15 @@ class AuthConfig(BaseModel):
     oauth2_scope:         Optional[str] = None
     oauth2_username:      Optional[str] = None
     oauth2_password:      Optional[str] = None
+    # Login request fields (imported from cURL); fetched token is held in `token`
+    login_method:       Optional[str] = "POST"
+    login_url:          Optional[str] = None
+    login_headers:      Dict[str, str] = {}
+    login_body:         Optional[str] = None      # raw body, sent as-is
+    login_token_path:   Optional[str] = None      # dot path in login response: "token", "data.access_token"
+    login_apply_as:     Optional[Literal["cookie", "bearer", "header", "query"]] = "cookie"
+    login_apply_name:   Optional[str] = None      # cookie / header / query param name
+    login_apply_prefix: Optional[str] = None      # custom header only, e.g. "Token "
 
 
 class EndpointRef(BaseModel):

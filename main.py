@@ -17,7 +17,7 @@ logger = logging.getLogger("api-chain")
 
 from engine.chain import extract_value, inject_context, resolve_path
 from engine.data_gen import generate_from_schema
-from engine.executor import execute_request, fetch_oauth2_token
+from engine.executor import execute_request, fetch_oauth2_token, run_login_request
 from engine.spec_parser import parse_spec
 from models.schemas import (
     APIConfig,
@@ -238,6 +238,20 @@ def _run_chain_sync(chain: ChainConfig) -> RunResult:
                 error=f"OAuth2 token fetch failed: {exc}",
             )
 
+    # Login request (imported cURL): fetch token before any steps; applied per login_apply_as
+    if auth and auth.type == "login":
+        login = run_login_request(auth, chain.verify_ssl, chain.timeout)
+        if not login["success"]:
+            return RunResult(
+                success=False, steps=[], context=context,
+                error=f"Login request failed: {login['error']}",
+            )
+        context["login_token"] = login["token"]
+        auth = auth.model_copy(update={"token": login["token"]})
+
+    # Pre-fetched auth must survive the per-step re-resolve below
+    base_auth = auth
+
     if chain.execution_steps:
         # ── Dynamic: user-configured ordered step list ────────────────────────
         for exec_step in chain.execution_steps:
@@ -247,14 +261,14 @@ def _run_chain_sync(chain: ChainConfig) -> RunResult:
             if not api:
                 continue
             early = _run_op(exec_step.operation, api, auth, chain, context, steps)
-            auth = _resolve_auth(chain.auth, context)
+            auth = _resolve_auth(base_auth, context)
             if early is not None:
                 return early
     else:
         # ── Legacy: fixed CREATE→READ→UPDATE→DELETE phases ────────────────────
         for api in chain.apis:
             early = _run_op("create", api, auth, chain, context, steps)
-            auth = _resolve_auth(chain.auth, context)
+            auth = _resolve_auth(base_auth, context)
             if early is not None:
                 return early
 
@@ -298,6 +312,18 @@ async def parse_spec_endpoint(req: ParseRequest):
 async def generate_body(schema: Dict[str, Any]):
     """Generate random request body from JSON schema"""
     return generate_from_schema(schema)
+
+
+class TestLoginRequest(BaseModel):
+    auth: AuthConfig
+    verify_ssl: bool = True
+    timeout: int = 30
+
+
+@app.post("/api/auth/test-login")
+async def test_login(req: TestLoginRequest):
+    """Run the imported login request once so the UI can preview the response and pick the token field"""
+    return run_login_request(req.auth, req.verify_ssl, req.timeout)
 
 
 @app.post("/api/run", response_model=RunResult)

@@ -1337,12 +1337,259 @@ document.getElementById('auth-type').addEventListener('change', function() {
   const section = document.getElementById(`auth-fields-${this.value}`);
   if (section) section.classList.remove('hidden');
   if (this.value === 'bearer') renderAuthTokenPicker();
+  if (this.value === 'login')  _updateLoginPreview();
 });
 
 function toggleOAuth2PasswordFields() {
   const grant = document.getElementById('oauth2-grant-type')?.value;
   const pwEl  = document.getElementById('oauth2-password-fields');
   if (pwEl) pwEl.style.display = grant === 'password' ? '' : 'none';
+}
+
+// ── cURL import ───────────────────────────────────────────────────────────────
+// Pure helpers (no DOM) for the "Login Request (import cURL)" auth type.
+
+// Split a pasted cURL command into shell-style tokens.
+// Handles bash (\), cmd (^) and PowerShell (`) line continuations, '…', "…" and $'…' quoting.
+function _curlTokenize(text) {
+  const s = String(text).replace(/\r\n?/g, '\n').replace(/[\\^`][ \t]*\n/g, ' ');
+  const out = [];
+  let cur = '', has = false, i = 0;
+  const push = () => { if (has) out.push(cur); cur = ''; has = false; };
+  while (i < s.length) {
+    const c = s[i];
+    if (c === "'") {                                   // literal until closing quote
+      const end = s.indexOf("'", i + 1);
+      cur += s.slice(i + 1, end < 0 ? s.length : end); has = true;
+      i = end < 0 ? s.length : end + 1;
+    } else if (c === '$' && s[i + 1] === "'") {        // ANSI-C quoting: backslash escapes
+      i += 2;
+      while (i < s.length && s[i] !== "'") {
+        if (s[i] === '\\' && i + 1 < s.length) { cur += ({ n:'\n', t:'\t', r:'\r' })[s[i + 1]] ?? s[i + 1]; i += 2; }
+        else cur += s[i++];
+      }
+      i++; has = true;
+    } else if (c === '"') {
+      i++;
+      while (i < s.length && s[i] !== '"') {
+        if (s[i] === '\\' && i + 1 < s.length && '"\\$`'.includes(s[i + 1])) { cur += s[i + 1]; i += 2; }
+        else cur += s[i++];
+      }
+      i++; has = true;
+    } else if (c === '\\' && i + 1 < s.length) { cur += s[i + 1]; has = true; i += 2; }
+    else if (/\s/.test(c)) { push(); i++; }
+    else { cur += c; has = true; i++; }
+  }
+  push();
+  return out;
+}
+
+// Parse a cURL command → { method, url, headers:{}, body } (body is the raw string). Throws on bad input.
+function _parseCurl(text) {
+  const tokens = _curlTokenize(text || '');
+  if (!tokens.length || !/^curl(\.exe)?$/i.test(tokens[0]))
+    throw new Error('Not a cURL command — it must start with "curl"');
+
+  const SHORT_ARG = ['-X','-H','-d','-u','-b','-A','-e','-o','-m','-x','-w','-F','-T','-c','-U'];
+  const SKIP_ARG  = ['-o','--output','-m','--max-time','--connect-timeout','-x','--proxy','-w','--write-out',
+                     '--retry','-F','--form','--cacert','--cert','--key','-T','--upload-file','-c','--cookie-jar',
+                     '--resolve','-U','--proxy-user'];
+  const res  = { method: '', url: '', headers: {}, body: '' };
+  const data = [];
+  let isJson = false;
+  const hasHeader = name => Object.keys(res.headers).some(k => k.toLowerCase() === name.toLowerCase());
+  const setHeader = line => {
+    const idx = line.indexOf(':');
+    if (idx > 0) res.headers[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  };
+
+  for (let i = 1; i < tokens.length; i++) {
+    let tok = tokens[i], val = null;
+    if (!tok.startsWith('-') || tok === '-') { if (!res.url) res.url = tok; continue; }
+    if (tok.startsWith('--')) {                        // --flag=value
+      const eq = tok.indexOf('=');
+      if (eq > 0) { val = tok.slice(eq + 1); tok = tok.slice(0, eq); }
+    } else if (tok.length > 2 && SHORT_ARG.includes(tok.slice(0, 2))) {   // -XPOST
+      val = tok.slice(2); tok = tok.slice(0, 2);
+    }
+    const next = () => (val !== null ? val : (tokens[++i] ?? ''));
+    switch (tok) {
+      case '-X': case '--request':    res.method = next().toUpperCase(); break;
+      case '-H': case '--header':     setHeader(next()); break;
+      case '-d': case '--data': case '--data-raw': case '--data-binary':
+      case '--data-ascii': case '--data-urlencode':
+                                      data.push(next()); break;
+      case '--json':                  data.push(next()); isJson = true; break;
+      case '-u': case '--user':       { const cred = next();
+                                        try { res.headers['Authorization'] = 'Basic ' + btoa(cred); } catch {} break; }
+      case '-b': case '--cookie':     res.headers['Cookie'] = next(); break;
+      case '-A': case '--user-agent': res.headers['User-Agent'] = next(); break;
+      case '-e': case '--referer':    res.headers['Referer'] = next(); break;
+      case '--url':                   res.url = next(); break;
+      case '-I': case '--head':       res.method = res.method || 'HEAD'; break;
+      default:                        if (SKIP_ARG.includes(tok) && val === null) i++;
+    }
+  }
+
+  if (!res.url) throw new Error('No URL found in the cURL command');
+  res.body = data.join('&');
+  if (isJson) {
+    if (!hasHeader('Content-Type')) res.headers['Content-Type'] = 'application/json';
+    if (!hasHeader('Accept'))       res.headers['Accept']       = 'application/json';
+  }
+  if (!res.method) res.method = res.body ? 'POST' : 'GET';
+  return res;
+}
+
+// "Name: value" lines → headers object
+function _parseHeaderLines(text) {
+  const out = {};
+  String(text || '').split(/\r?\n/).forEach(line => {
+    const idx = line.indexOf(':');
+    if (idx > 0 && line.slice(0, idx).trim()) out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  });
+  return out;
+}
+
+// Dot-paths of every scalar in a JSON response: {data:{token:'x'}} → ['data.token']
+function _flattenScalarPaths(obj, prefix) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return [];
+  let out = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const p = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === 'object') out = out.concat(_flattenScalarPaths(v, p));
+    else if (v !== null && v !== undefined) out.push(p);
+  }
+  return out;
+}
+// ── /cURL import ──────────────────────────────────────────────────────────────
+
+// ── Login Request auth (import cURL → fetch token → apply as cookie/bearer/header/query) ──
+function _loginAuthFromDom() {
+  const v = id => document.getElementById(id)?.value ?? '';
+  return {
+    type: 'login',
+    login_method:       v('login-method') || 'POST',
+    login_url:          v('login-url').trim(),
+    login_headers:      _parseHeaderLines(v('login-headers')),
+    login_body:         v('login-body') || null,
+    login_token_path:   v('login-token-path').trim() || null,
+    login_apply_as:     v('login-apply-as') || 'cookie',
+    login_apply_name:   v('login-apply-name').trim() || null,
+    login_apply_prefix: v('login-apply-prefix') || null,
+  };
+}
+
+function _setLoginStatus(id, ok, msg) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = ok ? 'var(--success)' : 'var(--error)';
+}
+
+function _setLoginMethod(method) {
+  const sel = document.getElementById('login-method');
+  if (!sel || !method) return;
+  if (![...sel.options].some(o => o.value === method)) sel.add(new Option(method, method));
+  sel.value = method;
+}
+
+function onParseLoginCurl() {
+  let parsed;
+  try { parsed = _parseCurl(document.getElementById('login-curl').value); }
+  catch (e) { _setLoginStatus('login-curl-status', false, '✗ ' + e.message); return; }
+
+  _setLoginMethod(parsed.method);
+  document.getElementById('login-url').value     = parsed.url;
+  document.getElementById('login-headers').value = Object.entries(parsed.headers).map(([k, v]) => `${k}: ${v}`).join('\n');
+  document.getElementById('login-body').value    = parsed.body;
+  _setLoginStatus('login-curl-status', true,
+    `✓ Parsed — ${parsed.method} ${parsed.url} · ${Object.keys(parsed.headers).length} header(s). Click "Fetch token" to test.`);
+  _updateLoginPreview();
+}
+
+async function onFetchLoginToken() {
+  const btn   = document.getElementById('btn-login-fetch');
+  const outEl = document.getElementById('login-test-result');
+  const auth  = _loginAuthFromDom();
+  if (!auth.login_url) { _setLoginStatus('login-test-status', false, '✗ Login URL is required — paste a cURL and click Parse.'); return; }
+
+  btn.disabled = true;
+  _setLoginStatus('login-test-status', true, 'Fetching…');
+  try {
+    const res = await api('/api/auth/test-login', {
+      auth,
+      verify_ssl: document.getElementById('opt-ssl')?.value !== 'false',
+      timeout:    parseInt(document.getElementById('opt-timeout')?.value) || 30,
+    });
+
+    const body = res.response_body;
+    if (body !== null && body !== undefined) {
+      outEl.textContent = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+      show(outEl);
+    } else hide(outEl);
+
+    // Offer every scalar field of the response as a token candidate
+    const paths = _flattenScalarPaths(body);
+    document.getElementById('login-token-paths').innerHTML =
+      paths.map(p => `<option value="${escHtml(p)}"></option>`).join('');
+
+    const pathEl = document.getElementById('login-token-path');
+    const statusOk = res.status_code >= 200 && res.status_code < 300;
+    if (statusOk && !pathEl.value.trim() && paths.length)
+      pathEl.value = paths.find(p => /token|jwt|session|sid/i.test(p)) || '';
+
+    const path  = pathEl.value.trim();
+    const token = statusOk && path ? _cDotGet(body, path) : null;
+    state._loginLastToken = (token !== null && token !== undefined && typeof token !== 'object') ? String(token) : null;
+
+    if (state._loginLastToken)
+      _setLoginStatus('login-test-status', true, `✓ ${res.status_code} — token read from "${path}"`);
+    else if (statusOk)
+      _setLoginStatus('login-test-status', false, path
+        ? `✗ ${res.status_code} OK, but no value at "${path}" — pick the token field below.`
+        : `✗ ${res.status_code} OK — pick which response field holds the token below.`);
+    else
+      _setLoginStatus('login-test-status', false, `✗ ${res.error || 'Login request failed'}`);
+  } catch (e) {
+    state._loginLastToken = null;
+    _setLoginStatus('login-test-status', false, '✗ ' + e.message);
+  } finally {
+    btn.disabled = false;
+    _updateLoginPreview();
+  }
+}
+
+function _updateLoginPreview() {
+  const v = id => document.getElementById(id)?.value ?? '';
+  const as     = v('login-apply-as') || 'cookie';
+  const name   = v('login-apply-name').trim();
+  const prefix = v('login-apply-prefix');
+  const defaults = { cookie: 'token', header: 'Authorization', query: 'token' };
+  const labels   = { cookie: 'Cookie Name', header: 'Header Name', query: 'Query Param Name' };
+
+  const nameGroup = document.getElementById('login-name-group');
+  if (nameGroup) nameGroup.style.display = as === 'bearer' ? 'none' : '';
+  const prefixGroup = document.getElementById('login-prefix-group');
+  if (prefixGroup) prefixGroup.style.display = as === 'header' ? '' : 'none';
+  const nameLabel = document.getElementById('login-name-label');
+  if (nameLabel) nameLabel.textContent = labels[as] || 'Name';
+  const nameInput = document.getElementById('login-apply-name');
+  if (nameInput) nameInput.placeholder = defaults[as] || '';
+  const warn = document.getElementById('login-cookie-warning');
+  if (warn) warn.style.display = as === 'cookie' ? '' : 'none';
+
+  const t   = state._loginLastToken;
+  const tok = t ? (t.length > 10 ? `${t.slice(0, 4)}…${t.slice(-3)}` : '•••') : '<token>';
+  const n   = name || defaults[as];
+  const preview = {
+    cookie: `Cookie: ${n}=${tok}`,
+    bearer: `Authorization: Bearer ${tok}`,
+    header: `${n}: ${prefix}${tok}`,
+    query:  `?${n}=${tok}  (added to every request URL)`,
+  }[as];
+  const pv = document.getElementById('login-preview');
+  if (pv) pv.textContent = preview;
 }
 
 // ── Shared: all {{vars}} from all APIs (recursive into nested schemas) ────────
@@ -1971,7 +2218,54 @@ function _cAuthHeaders(auth) {
   if (auth.type === 'bearer')  return { Authorization: `Bearer ${auth.token || ''}` };
   if (auth.type === 'basic')   return { Authorization: `Basic ${btoa((auth.username||'')+':'+(auth.password||''))}` };
   if (auth.type === 'api_key' && auth.key_in === 'header') return { [auth.key_name]: auth.key_value };
+  if (auth.type === 'login' && auth.token) {
+    // 'cookie' is absent on purpose: browsers refuse a Cookie header set from fetch()
+    if (auth.login_apply_as === 'bearer') return { Authorization: `Bearer ${auth.token}` };
+    if (auth.login_apply_as === 'header')
+      return { [auth.login_apply_name || 'Authorization']: `${auth.login_apply_prefix || ''}${auth.token}` };
+  }
   return {};
+}
+
+function _cAuthParams(auth) {
+  if (auth?.type === 'login' && auth.token && auth.login_apply_as === 'query')
+    return { [auth.login_apply_name || 'token']: auth.token };
+  return {};
+}
+
+// JS equivalent of executor.run_login_request: send the imported login request, extract the token
+async function _cRunLoginRequest(auth) {
+  const out = { success: false, status_code: null, response_body: null, token: null, error: null };
+  if (!auth.login_url) { out.error = 'Login request URL is required'; return out; }
+
+  const body    = auth.login_body || null;
+  const headers = { Accept: 'application/json' };
+  if (body !== null)
+    headers['Content-Type'] = /^\s*[{[]/.test(body) ? 'application/json' : 'application/x-www-form-urlencoded';
+  Object.assign(headers, auth.login_headers || {});
+
+  try {
+    const opts = { method: (auth.login_method || 'POST').toUpperCase(), headers };
+    if (body !== null) opts.body = body;
+    const resp = await fetch(auth.login_url, opts);
+    const text = await resp.text();
+    let data = text;
+    try { data = JSON.parse(text); } catch {}
+    out.status_code   = resp.status;
+    out.response_body = data;
+    if (!resp.ok) { out.error = `HTTP ${resp.status}: ${text.slice(0, 300)}`; return out; }
+
+    const path = (auth.login_token_path || '').trim();
+    let token = path ? _cDotGet(data, path)
+                     : ['access_token', 'token', 'id_token'].map(k => data?.[k]).find(Boolean);
+    if (token === null || token === undefined || typeof token === 'object') {
+      out.error = `No token at ${path ? `field '${path}'` : 'access_token / token / id_token'} in login response: ${text.slice(0, 300)}`;
+      return out;
+    }
+    out.token   = String(token);
+    out.success = true;
+  } catch (e) { out.error = e.message; }
+  return out;
 }
 
 async function _runStepsClientSide(chain) {
@@ -1981,6 +2275,19 @@ async function _runStepsClientSide(chain) {
   const opMethod      = { create:'POST', read:'GET', update:'PUT', delete:'DELETE' };
 
   const activeSteps = (chain.execution_steps || []).filter(s => s.enabled);
+
+  // Login request (imported cURL): fetch token before any steps, same as server mode
+  let globalAuth = chain.auth;
+  if (globalAuth?.type === 'login') {
+    if ((globalAuth.login_apply_as || 'cookie') === 'cookie')
+      return { success: false, steps: [], context: ctx,
+               error: 'Cookie auth cannot run in Browser mode (browsers refuse a Cookie header from page scripts) — switch "Run via" to Server.' };
+    const login = await _cRunLoginRequest(globalAuth);
+    if (!login.success)
+      return { success: false, steps: [], context: ctx, error: `Login request failed: ${login.error}` };
+    ctx.login_token = login.token;
+    globalAuth = { ...globalAuth, token: login.token };
+  }
 
   for (const step of activeSteps) {
     const apiCfg = chain.apis.find(a => a.id === step.api_id);
@@ -1995,7 +2302,7 @@ async function _runStepsClientSide(chain) {
     if (method === 'POST') body = _cInject(apiCfg.post_body, ctx) || null;
     if (method === 'PUT')  body = _cInject(apiCfg.put_body || apiCfg.post_body, ctx) || null;
 
-    const effAuth    = (apiCfg.auth?.type && apiCfg.auth.type !== 'none') ? apiCfg.auth : chain.auth;
+    const effAuth    = (apiCfg.auth?.type && apiCfg.auth.type !== 'none') ? apiCfg.auth : globalAuth;
     const customHdrs = {};
     for (const [k, v] of Object.entries(apiCfg.custom_headers || {}))
       customHdrs[k] = _cInject(v, ctx);
@@ -2008,7 +2315,8 @@ async function _runStepsClientSide(chain) {
     try {
       const opts = { method, headers };
       if (body !== null) opts.body = JSON.stringify(body);
-      const resp = await fetch(url, opts);
+      const qs   = new URLSearchParams(_cAuthParams(effAuth)).toString();
+      const resp = await fetch(qs ? url + (url.includes('?') ? '&' : '?') + qs : url, opts);
       status = resp.status;
       try { respBody = (resp.headers.get('content-type')||'').includes('json')
               ? await resp.json() : await resp.text(); }
@@ -2066,6 +2374,8 @@ async function runChain() {
       ? await _runStepsClientSide(chainConfig)
       : await api('/api/run', { chain: chainConfig });
     renderResults(result);
+    // Pre-flight failure (login / OAuth2 token fetch): no steps ran, so surface the reason
+    if (!result.success && result.error && !result.steps.length) showResultBanner(false, result.error);
   } catch(e) {
     showResultBanner(false, 'Request failed: ' + e.message);
   } finally {
@@ -2097,6 +2407,7 @@ function buildChainConfig() {
     auth.oauth2_username      = document.getElementById('oauth2-username').value;
     auth.oauth2_password      = document.getElementById('oauth2-password').value;
   }
+  if (authType === 'login') auth = _loginAuthFromDom();
 
   const apis = state.apis.map(a => {
     const sel = state.selections[a.id] || {};
@@ -2739,6 +3050,15 @@ function saveSession() {
       oauth2Scope:       document.getElementById('oauth2-scope')?.value        || '',
       oauth2Username:    document.getElementById('oauth2-username')?.value     || '',
       oauth2Password:    document.getElementById('oauth2-password')?.value     || '',
+      loginCurl:         document.getElementById('login-curl')?.value          || '',
+      loginMethod:       document.getElementById('login-method')?.value        || 'POST',
+      loginUrl:          document.getElementById('login-url')?.value           || '',
+      loginHeaders:      document.getElementById('login-headers')?.value       || '',
+      loginBody:         document.getElementById('login-body')?.value          || '',
+      loginTokenPath:    document.getElementById('login-token-path')?.value    || '',
+      loginApplyAs:      document.getElementById('login-apply-as')?.value      || 'cookie',
+      loginApplyName:    document.getElementById('login-apply-name')?.value    || '',
+      loginApplyPrefix:  document.getElementById('login-apply-prefix')?.value  || '',
     },
   };
 
@@ -2794,6 +3114,18 @@ function _applySession(data) {
   setVal('oauth2-username',      ga.oauth2Username);
   setVal('oauth2-password',      ga.oauth2Password);
   toggleOAuth2PasswordFields();
+  setVal('login-curl',           ga.loginCurl);
+  _setLoginMethod(ga.loginMethod || 'POST');
+  setVal('login-url',            ga.loginUrl);
+  setVal('login-headers',        ga.loginHeaders);
+  setVal('login-body',           ga.loginBody);
+  setVal('login-token-path',     ga.loginTokenPath);
+  const applyAsEl = document.getElementById('login-apply-as');
+  if (applyAsEl) applyAsEl.value = ga.loginApplyAs || 'cookie';
+  setVal('login-apply-name',     ga.loginApplyName);
+  setVal('login-apply-prefix',   ga.loginApplyPrefix);
+  state._loginLastToken = null;
+  _updateLoginPreview();
 
   // Re-populate spec panel if spec present
   if (state.spec && state.endpoints.length) {
